@@ -40,6 +40,10 @@ class InclusiveCacheControl(outer: InclusiveCache, control: InclusiveCacheContro
       val flush_match = Input(Bool())
       val flush_req = Decoupled(UInt(64.W))
       val flush_resp = Input(Bool())
+      // Performance counter inputs
+      val hit_count = Input(UInt(64.W))
+      val miss_count = Input(UInt(64.W))
+      val total_access_count = Input(UInt(64.W))
     })
     // Flush directive
     val flushInValid   = RegInit(false.B)
@@ -83,8 +87,19 @@ class InclusiveCacheControl(outer: InclusiveCache, control: InclusiveCacheContro
     val lgBlockBytesR = RegField.r(8, log2Ceil(outer.cache.blockBytes).U, RegFieldDesc("lgBlockBytes",
       "Base-2 logarithm of the bytes per cache block", reset=Some(log2Ceil(outer.cache.blockBytes))))
 
+    // Performance counter registers
+    val hitCountR = RegField.r(64, io.hit_count, RegFieldDesc("HitCount", 
+      "Total number of cache hits since reset"))
+    val missCountR = RegField.r(64, io.miss_count, RegFieldDesc("MissCount",
+      "Total number of cache misses since reset"))
+    val totalAccessCountR = RegField.r(64, io.total_access_count, RegFieldDesc("TotalAccessCount",
+      "Total number of cache accesses since reset"))
+
     val regmap = ctrlnode.regmap(
       0x000 -> RegFieldGroup("Config", Some("Information about the Cache Configuration"), Seq(banksR, waysR, lgSetsR, lgBlockBytesR)),
+      0x100 -> RegFieldGroup("Performance", Some("Cache Performance Counters"), Seq(hitCountR)),
+      0x108 -> RegFieldGroup("Performance", Some("Cache Performance Counters"), Seq(missCountR)),
+      0x110 -> RegFieldGroup("Performance", Some("Cache Performance Counters"), Seq(totalAccessCountR)),
       0x200 -> (if (control.beatBytes >= 8) Seq(flush64) else Nil),
       0x240 -> Seq(flush32)
     )

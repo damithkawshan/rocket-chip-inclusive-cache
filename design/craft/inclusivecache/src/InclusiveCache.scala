@@ -122,6 +122,11 @@ class InclusiveCache(
       println("")
     }
 
+    // Performance counters for hit/miss tracking
+    val hitCounter = RegInit(0.U(64.W))
+    val missCounter = RegInit(0.U(64.W))
+    val totalAccessCounter = RegInit(0.U(64.W))
+
     // Create the L2 Banks
     val mods = (node.in zip node.out) map { case ((in, edgeIn), (out, edgeOut)) =>
       edgeOut.manager.managers.foreach { m =>
@@ -156,10 +161,28 @@ class InclusiveCache(
       scheduler
     }
 
+    // Aggregate performance counters from all banks
+    val bankHits = mods.map(_.io.perf.access_hit)
+    val bankAccesses = mods.map(_.io.perf.access_valid)
+    
+    // Count total hits, misses, and accesses across all banks
+    val cycleHits = PopCount(bankHits)
+    val cycleAccesses = PopCount(bankAccesses)
+    val cycleMisses = cycleAccesses - cycleHits
+    
+    // Update counters
+    hitCounter := hitCounter + cycleHits
+    missCounter := missCounter + cycleMisses  
+    totalAccessCounter := totalAccessCounter + cycleAccesses
+
     ctrls.foreach { ctrl =>
       ctrl.module.io.flush_req.ready := false.B
       ctrl.module.io.flush_resp := false.B
       ctrl.module.io.flush_match := false.B
+      // Connect performance counters to control interface
+      ctrl.module.io.hit_count := hitCounter
+      ctrl.module.io.miss_count := missCounter
+      ctrl.module.io.total_access_count := totalAccessCounter
     }
 
     mods.zip(node.edges.in).zipWithIndex.foreach { case ((sched, edgeIn), i) =>

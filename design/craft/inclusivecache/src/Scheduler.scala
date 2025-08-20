@@ -35,6 +35,11 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
     // Control port
     val req = Flipped(Decoupled(new SinkXRequest(params)))
     val resp = Decoupled(new SourceXRequest(params))
+    // Performance monitoring
+    val perf = new Bundle {
+      val access_valid = Output(Bool())
+      val access_hit = Output(Bool())
+    }
   })
 
   val sourceA = Module(new SourceA(params))
@@ -342,6 +347,10 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   sourceD.io.grant_req := sinkD  .io.grant_req
   sourceC.io.evict_safe := sourceD.io.evict_safe
   sinkD  .io.grant_safe := sourceD.io.grant_safe
+
+  // Performance monitoring - track directory access and hit/miss
+  io.perf.access_valid := directory.io.result.valid
+  io.perf.access_hit := directory.io.result.valid && directory.io.result.bits.hit
 
   private def afmt(x: AddressSet) = s"""{"base":${x.base},"mask":${x.mask}}"""
   private def addresses = params.inner.manager.managers.flatMap(_.address).map(afmt _).mkString(",")

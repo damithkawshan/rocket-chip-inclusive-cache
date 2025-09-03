@@ -220,6 +220,12 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   val meta_no_clients = !meta.clients.orR
   val req_promoteT = req_acquire && Mux(meta.hit, meta_no_clients && meta.state === TIP, gotT)
 
+  // when (request_valid) {
+  //   printf("MSHR: Valid request - source=0x%x, clientBit=0x%x, clientId=%d, opcode=0x%x, addr=0x%x\n",
+  //     request.source, req_clientBit, OHToUInt(req_clientBit), request.opcode, 
+  //     Cat(request.tag, request.set, 0.U(log2Ceil(params.cache.blockBytes).W)))
+  // }
+
   when (request.prio(2) && (!params.firstLevel).B) { // always a hit
     final_meta_writeback.dirty   := meta.dirty || request.opcode(0)
     final_meta_writeback.state   := Mux(request.param =/= TtoT && meta.state === TRUNK, TIP, meta.state)

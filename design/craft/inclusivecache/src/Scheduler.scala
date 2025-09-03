@@ -26,6 +26,13 @@ import freechips.rocketchip.util._
 
 class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Module
 {
+
+  // Calculate numBanks like in BankedStore
+  val innerBytes = params.inner.manager.beatBytes
+  val outerBytes = params.outer.manager.beatBytes
+  val rowBytes = params.micro.portFactor * math.max(innerBytes, outerBytes)
+  val numBanks = rowBytes / params.micro.writeBytes
+
   val io = IO(new Bundle {
     val in = Flipped(TLBundle(params.inner.bundle))
     val out = TLBundle(params.outer.bundle)
@@ -34,6 +41,10 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
     val divs = Flipped(Vec(params.allClients, UInt((InclusiveCacheParameters.lfsrBits + 1).W)))
     // Control port
     val req = Flipped(Decoupled(new SinkXRequest(params)))
+
+    //Bank disable ct
+    val bankDisable = Input(UInt(4.W))
+
     val resp = Decoupled(new SourceXRequest(params))
     // Performance monitoring
     val perf = new Bundle {
@@ -339,6 +350,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   bankedStore.io.sourceD_radr <> sourceD.io.bs_radr
   bankedStore.io.sourceD_wadr <> sourceD.io.bs_wadr
   bankedStore.io.sourceD_wdat := sourceD.io.bs_wdat
+  bankedStore.io.bankDisable := io.bankDisable
   sourceC.io.bs_dat := bankedStore.io.sourceC_dat
   sourceD.io.bs_rdat := bankedStore.io.sourceD_rdat
 

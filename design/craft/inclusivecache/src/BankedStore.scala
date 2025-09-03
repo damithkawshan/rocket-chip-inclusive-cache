@@ -3,7 +3,7 @@
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
- * You should have received a copy of LICENSE.Apache2 along with
+ * You may obtain a copy of LICENSE.Apache2 along with
  * this software. If not, you may obtain a copy at
  *
  *    https://www.apache.org/licenses/LICENSE-2.0
@@ -58,6 +58,16 @@ class BankedStoreOuterDecoded(params: InclusiveCacheParameters) extends BankedSt
 
 class BankedStore(params: InclusiveCacheParameters) extends Module
 {
+  val innerBytes = params.inner.manager.beatBytes
+  val outerBytes = params.outer.manager.beatBytes
+  val rowBytes = params.micro.portFactor * max(innerBytes, outerBytes)
+  require (rowBytes < params.cache.sizeBytes)
+  val rowEntries = params.cache.sizeBytes / rowBytes
+  val rowBits = log2Ceil(rowEntries)
+  val numBanks = rowBytes / params.micro.writeBytes
+  val codeBits = 8*params.micro.writeBytes
+
+
   val io = IO(new Bundle {
     val sinkC_adr = Flipped(Decoupled(new BankedStoreInnerAddress(params)))
     val sinkC_dat = Flipped(new BankedStoreInnerPoison(params))
@@ -69,26 +79,41 @@ class BankedStore(params: InclusiveCacheParameters) extends Module
     val sourceD_rdat = new BankedStoreInnerDecoded(params)
     val sourceD_wadr = Flipped(Decoupled(new BankedStoreInnerAddress(params)))
     val sourceD_wdat = Flipped(new BankedStoreInnerPoison(params))
+    // Bank disable input
+    val bankDisable = Input(UInt(numBanks.W))
   })
 
-  val innerBytes = params.inner.manager.beatBytes
-  val outerBytes = params.outer.manager.beatBytes
-  val rowBytes = params.micro.portFactor * max(innerBytes, outerBytes)
-  require (rowBytes < params.cache.sizeBytes)
-  val rowEntries = params.cache.sizeBytes / rowBytes
-  val rowBits = log2Ceil(rowEntries)
-  val numBanks = rowBytes / params.micro.writeBytes
-  val codeBits = 8*params.micro.writeBytes
+  // Log BankedStore generator parameters
+  println(s"[BankedStore] Generator Parameters:")
+  println(s"  innerBytes = $innerBytes")
+  println(s"  outerBytes = $outerBytes")
+  println(s"  portFactor = ${params.micro.portFactor}")
+  println(s"  writeBytes = ${params.micro.writeBytes}")
+  println(s"  rowBytes = $rowBytes")
+  println(s"  rowEntries = $rowEntries")
+  println(s"  numBanks = $numBanks")
+  println(s"  codeBits = $codeBits")
+  println(s"  cache.sizeBytes = ${params.cache.sizeBytes}")
+  println(s"  cache.blockBytes = ${params.cache.blockBytes}")
+  println(s"  [BANK REDIRECT] Bank 1 redirected to bank 0 second half (rowEntries offset)")
 
   val cc_banks = Seq.tabulate(numBanks) {
     i =>
+      val bankSize = if (i == 0) rowEntries * 2 else rowEntries
       DescribedSRAM(
         name = s"cc_banks_$i",
         desc = "Banked Store",
-        size = rowEntries,
+        size = bankSize,
         data = UInt(codeBits.W)
       )
   }
+
+  //Bank disable
+  // The banked store can disable individual banks based on the bankDisable input.
+  val bankDisableReg = io.bankDisable
+  require(bankDisableReg.getWidth == numBanks, s"bankDisable width ${bankDisableReg.getWidth} != expected $numBanks")
+
+
   // These constraints apply on the port priorities:
   //  sourceC > sinkD     outgoing Release > incoming Grant      (we start eviction+refill concurrently)
   //  sinkC > sourceC     incoming ProbeAck > outgoing ProbeAck  (we delay probeack writeback by 1 cycle for QoR)
@@ -113,6 +138,10 @@ class BankedStore(params: InclusiveCacheParameters) extends Module
     val bankSum  = UInt(numBanks.W) // OR of all higher priority bankSels
     val bankEn   = UInt(numBanks.W) // ports actually activated by request
     val data     = Vec(numBanks, UInt(codeBits.W))
+    // New fields for bank redirection
+    val redirectedIndex = UInt((rowBits + 1).W) // Extra bit for doubled bank 0 size
+    val redirectedBankSel = UInt(numBanks.W)
+    val redirectedBankEn = UInt(numBanks.W)
   }
 
   def req[T <: BankedStoreAddress](b: DecoupledIO[T], write: Bool, d: UInt): Request = {
@@ -128,13 +157,33 @@ class BankedStore(params: InclusiveCacheParameters) extends Module
     val out = Wire(new Request)
 
     val select = UIntToOH(a(bankBits-1, 0), numBanks/ports)
+    val originalBankSel = FillInterleaved(ports, select) & Fill(numBanks/ports, m)
+
+    //check if bank disable is set for bank 1, then redirect to bank 0
+    val disableBank1 = originalBankSel(1) & bankDisableReg(1) // If bank 1 is selected and disabled
+      
+    // Redirect bank 1 requests to bank 0
+    val redirectedBankSel = Wire(UInt(numBanks.W))
+    redirectedBankSel := originalBankSel
+    when (disableBank1) {
+      printf(p"[BankedStore][req] Bank 1 disabled :: bankDisableReg = 0b${Binary(bankDisableReg-1.U)}, originalBankSel = 0b${Binary(originalBankSel)}\n")
+      redirectedBankSel := (originalBankSel & (~1.U(numBanks.W))) | 1.U(numBanks.W) // Clear bank 1, set bank 0
+    }
+    
     val ready  = Cat(Seq.tabulate(numBanks/ports) { i => !(out.bankSum((i+1)*ports-1, i*ports) & m).orR } .reverse)
     b.ready := ready(a(bankBits-1, 0))
 
     out.wen      := write
     out.index    := a >> bankBits
-    out.bankSel  := Mux(b.valid, FillInterleaved(ports, select) & Fill(numBanks/ports, m), 0.U)
-    out.bankEn   := Mux(b.bits.noop, 0.U, out.bankSel & FillInterleaved(ports, ready))
+    out.bankSel  := Mux(b.valid, originalBankSel, 0.U)
+    out.redirectedBankSel := Mux(b.valid, redirectedBankSel, 0.U)
+    out.bankEn   := Mux(b.bits.noop, 0.U, out.redirectedBankSel & FillInterleaved(ports, ready))
+    out.redirectedBankEn := out.bankEn
+    
+    // Calculate redirected index (add rowEntries offset if originally targeting bank 1)
+    val indexOffset = Mux(disableBank1, rowEntries.U, 0.U)
+    out.redirectedIndex := (a >> bankBits) + indexOffset
+    
     out.data     := Seq.fill(numBanks/ports) { words }.flatten
 
     out
@@ -158,32 +207,44 @@ class BankedStore(params: InclusiveCacheParameters) extends Module
   // to obtain a needed subbank, it still blocks overlapping lower priority requests.
   reqs.foldLeft(0.U) { case (sum, req) =>
     req.bankSum := sum
-    req.bankSel | sum
+    req.redirectedBankSel | sum
   }
+  
   // Access the banks
   val regout = VecInit(cc_banks.zipWithIndex.map { case (b, i) =>
-    val en  = reqs.map(_.bankEn(i)).reduce(_||_)
-    val sel = reqs.map(_.bankSel(i))
+    val en  = reqs.map(_.redirectedBankEn(i)).reduce(_||_)
+    val sel = reqs.map(_.redirectedBankSel(i))
     val wen = PriorityMux(sel, reqs.map(_.wen))
-    val idx = PriorityMux(sel, reqs.map(_.index))
+    val idx = if (i == 0) {
+      // For bank 0, use redirected index which includes offset for bank 1 data
+      PriorityMux(sel, reqs.map(_.redirectedIndex))
+    } else {
+      // For other banks, use original index (but bank 1 should never be accessed)
+      PriorityMux(sel, reqs.map(_.index))
+    }
     val data= PriorityMux(sel, reqs.map(_.data(i)))
 
-    when (wen && en) { b.write(idx, data) }
+    // Use the redirected enable signals which handle bank disable logic
+    when (wen && en) { 
+      b.write(idx, data) 
+    }
+
     RegEnable(b.read(idx, !wen && en), RegNext(!wen && en))
   })
 
-  val regsel_sourceC = RegNext(RegNext(sourceC_req.bankEn))
-  val regsel_sourceD = RegNext(RegNext(sourceD_rreq.bankEn))
+  val regsel_sourceC = RegNext(RegNext(sourceC_req.redirectedBankEn))
+  val regsel_sourceD = RegNext(RegNext(sourceD_rreq.redirectedBankEn))
 
   val decodeC = regout.zipWithIndex.map {
-    case (r, i) => Mux(regsel_sourceC(i), r, 0.U)
+    case (r, i) => 
+      Mux(regsel_sourceC(i), r, 0.U)
   }.grouped(outerBytes/params.micro.writeBytes).toList.transpose.map(s => s.reduce(_|_))
 
   io.sourceC_dat.data := Cat(decodeC.reverse)
 
   val decodeD = regout.zipWithIndex.map {
-    // Intentionally not Mux1H and/or an indexed-mux b/c we want it 0 when !sel to save decode power
-    case (r, i) => Mux(regsel_sourceD(i), r, 0.U)
+    case (r, i) => 
+      Mux(regsel_sourceD(i), r, 0.U)
   }.grouped(innerBytes/params.micro.writeBytes).toList.transpose.map(s => s.reduce(_|_))
 
   io.sourceD_rdat.data := Cat(decodeD.reverse)

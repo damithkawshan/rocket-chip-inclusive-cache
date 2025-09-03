@@ -128,7 +128,7 @@ class InclusiveCache(
     val totalAccessCounter = RegInit(0.U(64.W))
 
     // Create the L2 Banks
-    val mods = (node.in zip node.out) map { case ((in, edgeIn), (out, edgeOut)) =>
+    val mods = (node.in zip node.out).zipWithIndex.map { case (((in, edgeIn), (out, edgeOut)), i) =>
       edgeOut.manager.managers.foreach { m =>
         require (m.supportsAcquireB.contains(xfer),
           s"All managers behind the L2 must support acquireB($xfer) " +
@@ -151,6 +151,12 @@ class InclusiveCache(
       scheduler.io.req.bits.address := 0.U
       scheduler.io.resp.ready := true.B
 
+      // Connect bankDisable from control register if present
+      if (ctrls.nonEmpty && i < ctrls.length) {
+        scheduler.io.bankDisable := ctrls(i).module.io.bankDisable
+      } else {
+        scheduler.io.bankDisable := 0.U
+      }
 
       // Fix-up the missing addresses. We do this here so that the Scheduler can be
       // deduplicated by Firrtl to make hierarchical place-and-route easier.

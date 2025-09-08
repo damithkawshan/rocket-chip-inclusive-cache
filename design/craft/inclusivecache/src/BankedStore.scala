@@ -166,7 +166,7 @@ class BankedStore(params: InclusiveCacheParameters) extends Module
     val redirectedBankSel = Wire(UInt(numBanks.W))
     redirectedBankSel := originalBankSel
     when (disableBank1) {
-      printf(p"[BankedStore][req] Bank 1 disabled :: bankDisableReg = 0b${Binary(bankDisableReg-1.U)}, originalBankSel = 0b${Binary(originalBankSel)}\n")
+      // printf(p"[BankedStore][req] Bank 1 disabled :: bankDisableReg = 0b${Binary(bankDisableReg-1.U)}, originalBankSel = 0b${Binary(originalBankSel)}\n")
       redirectedBankSel := (originalBankSel & (~1.U(numBanks.W))) | 1.U(numBanks.W) // Clear bank 1, set bank 0
     }
     
@@ -177,8 +177,16 @@ class BankedStore(params: InclusiveCacheParameters) extends Module
     out.index    := a >> bankBits
     out.bankSel  := Mux(b.valid, originalBankSel, 0.U)
     out.redirectedBankSel := Mux(b.valid, redirectedBankSel, 0.U)
-    out.bankEn   := Mux(b.bits.noop, 0.U, out.redirectedBankSel & FillInterleaved(ports, ready))
-    out.redirectedBankEn := out.bankEn
+    out.bankEn   := Mux(b.bits.noop, 0.U, originalBankSel & FillInterleaved(ports, ready))
+    
+    // For redirectedBankEn, we want to enable the redirected banks but disable any originally disabled banks
+    val enableMask = Wire(UInt(numBanks.W))
+    enableMask := ~bankDisableReg
+    when (disableBank1) {
+      // If bank 1 was disabled and redirected to bank 0, allow bank 0 but keep bank 1 disabled
+      enableMask := ~bankDisableReg | 1.U(numBanks.W) // Enable bank 0
+    }
+    out.redirectedBankEn := Mux(b.bits.noop, 0.U, out.redirectedBankSel & FillInterleaved(ports, ready) & enableMask)
     
     // Calculate redirected index (add rowEntries offset if originally targeting bank 1)
     val indexOffset = Mux(disableBank1, rowEntries.U, 0.U)

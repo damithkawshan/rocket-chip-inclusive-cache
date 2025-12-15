@@ -19,7 +19,6 @@ package sifive.blocks.inclusivecache
 
 import chisel3._
 import chisel3.util._
-import chisel3.internal.sourceinfo.SourceInfo
 import org.chipsalliance.cde.config._
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
@@ -252,7 +251,7 @@ case class InclusiveCacheParameters(
     if (micro.dirReg) RegEnable(x, en) else x
   }
 
-  def ccover(cond: Bool, label: String, desc: String)(implicit sourceInfo: SourceInfo) =
+  def ccover(cond: Bool, label: String, desc: String) =
     cover(cond, "CCACHE_L" + cache.level + "_" + label, "MemorySystem;;" + desc)
 }
 

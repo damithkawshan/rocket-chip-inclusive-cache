@@ -59,7 +59,7 @@ class WithInclusiveCache(
       sets = (capacityKB * 1024)/(site(CacheBlockBytes) * nWays * up(SubsystemBankedCoherenceKey, site).nBanks),
       ways = nWays,
       memCycles = outerLatencyCycles,
-      writeBytes = site(XLen)/8,
+      writeBytes = site(MaxXLen)/8,
       portFactor = subBankingFactor,
       hintsSkipProbe = hintsSkipProbe,
       bankedControl = bankedControl,

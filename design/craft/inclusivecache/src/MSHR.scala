@@ -19,13 +19,12 @@ package sifive.blocks.inclusivecache
 
 import chisel3._
 import chisel3.util._
-import chisel3.internal.sourceinfo.SourceInfo
 import freechips.rocketchip.tilelink._
 import TLPermissions._
 import TLMessages._
 import MetaData._
 import chisel3.PrintableHelper
-import chisel3.experimental.dataview.BundleUpcastable
+import chisel3.experimental.dataview._
 
 class ScheduleRequest(params: InclusiveCacheParameters) extends InclusiveCacheBundle(params)
 {
@@ -244,11 +243,11 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     final_meta_writeback.state := Mux(req_needT,
                                     Mux(req_acquire, TRUNK, TIP),
                                     Mux(!meta.hit, Mux(gotT, Mux(req_acquire, TRUNK, TIP), BRANCH),
-                                      MuxLookup(meta.state, 0.U(2.W), Seq(
-                                        INVALID -> BRANCH,
-                                        BRANCH  -> BRANCH,
-                                        TRUNK   -> TIP,
-                                        TIP     -> Mux(meta_no_clients && req_acquire, TRUNK, TIP)))))
+                                      MuxCase(0.U(params.stateBits.W), Seq(
+                                        (meta.state === INVALID) -> BRANCH,
+                                        (meta.state === BRANCH)  -> BRANCH,
+                                        (meta.state === TRUNK)   -> TIP,
+                                        (meta.state === TIP)     -> Mux(meta_no_clients && req_acquire, TRUNK, TIP)))))
     final_meta_writeback.clients := Mux(meta.hit, meta.clients & ~probes_toN, 0.U) |
                                     Mux(req_acquire, req_clientBit, 0.U)
     final_meta_writeback.tag := request.tag
@@ -303,10 +302,10 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   io.schedule.bits.c.bits.dirty   := meta.dirty
   io.schedule.bits.d.bits.viewAsSupertype(chiselTypeOf(request)) := request
   io.schedule.bits.d.bits.param   := Mux(!req_acquire, request.param,
-                                       MuxLookup(request.param, request.param, Seq(
-                                         NtoB -> Mux(req_promoteT, NtoT, NtoB),
-                                         BtoT -> Mux(honour_BtoT,  BtoT, NtoT),
-                                         NtoT -> NtoT)))
+                                       MuxCase(request.param, Seq(
+                                         (request.param === NtoB) -> Mux(req_promoteT, NtoT, NtoB),
+                                         (request.param === BtoT) -> Mux(honour_BtoT,  BtoT, NtoT),
+                                         (request.param === NtoT) -> NtoT)))
   io.schedule.bits.d.bits.sink    := 0.U
   io.schedule.bits.d.bits.way     := meta.way
   io.schedule.bits.d.bits.bad     := bad_grant
@@ -346,7 +345,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   val before = cacheState(meta, meta.hit)
   val after  = cacheState(final_meta_writeback, true.B)
 
-  def eviction(from: CacheState, cover: Boolean)(implicit sourceInfo: SourceInfo) {
+  def eviction(from: CacheState, cover: Boolean): Unit = {
     if (cover) {
       params.ccover(evict === from.code, s"MSHR_${from}_EVICT", s"State transition from ${from} to evicted ${cfg}")
     } else {
@@ -359,7 +358,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     }
   }
 
-  def transition(from: CacheState, to: CacheState, cover: Boolean)(implicit sourceInfo: SourceInfo) {
+  def transition(from: CacheState, to: CacheState, cover: Boolean): Unit = {
     if (cover) {
       params.ccover(before === from.code && after === to.code, s"MSHR_${from}_${to}", s"State transition from ${from} to ${to} ${cfg}")
     } else {
@@ -516,7 +515,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   val new_skipProbe = Mux(skipProbeN(new_request.opcode, params.cache.hintsSkipProbe), new_clientBit, 0.U)
 
   val prior = cacheState(final_meta_writeback, true.B)
-  def bypass(from: CacheState, cover: Boolean)(implicit sourceInfo: SourceInfo) {
+  def bypass(from: CacheState, cover: Boolean): Unit = {
     if (cover) {
       params.ccover(prior === from.code, s"MSHR_${from}_BYPASS", s"State bypass transition from ${from} ${cfg}")
     } else {

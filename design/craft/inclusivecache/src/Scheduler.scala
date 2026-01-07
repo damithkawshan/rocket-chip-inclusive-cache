@@ -51,6 +51,8 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
       val access_valid = Output(Bool())
       val access_hit = Output(Bool())
     }
+    // Saturation counters output (one per set, 8-bit each)
+    val satCounters = Output(Vec(params.cache.sets, UInt(8.W)))
   })
 
   val sourceA = Module(new SourceA(params))
@@ -99,6 +101,22 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
     m.io.sinkd.bits := sinkD.io.resp.bits
     m.io.sinke.bits := sinkE.io.resp.bits
     m.io.nestedwb := nestedwb
+    // Connect partner lookup for migration - arbitrate among MSHRs
+    m.io.partnerResult.valid := false.B
+    m.io.partnerResult.bits := directory.io.partnerResult.bits
+  }
+  
+  // Partner lookup arbitration - only one MSHR can use partner lookup at a time
+  val partnerLookupReqs = mshrs.map(_.io.partnerLookup.valid)
+  val partnerLookupGrant = PriorityEncoderOH(partnerLookupReqs)
+  directory.io.partnerLookup.valid := partnerLookupReqs.reduce(_ || _)
+  directory.io.partnerLookup.bits := Mux1H(partnerLookupGrant, mshrs.map(_.io.partnerLookup.bits))
+  
+  // Route partner result back to the requesting MSHR
+  mshrs.zipWithIndex.foreach { case (m, i) =>
+    when (partnerLookupGrant(i) && directory.io.partnerResult.valid) {
+      m.io.partnerResult.valid := true.B
+    }
   }
 
   // If the pre-emption BC or C MSHR have a matching set, the normal MSHR must be blocked
@@ -360,9 +378,25 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   sourceC.io.evict_safe := sourceD.io.evict_safe
   sinkD  .io.grant_safe := sourceD.io.grant_safe
 
+  // Migration handling
+  // When a migration is scheduled, we need to:
+  // 1. If partner victim is dirty, evict it to memory first (via SourceC)
+  // 2. Copy data from source set/way to partner set/way (via BankedStore)
+  // 3. Update directory entries for both sets
+  when (schedule.migrate.valid && mshr_selectOH.orR) {
+    printf("L2 Migration Execute: srcSet=%d srcWay=%d srcTag=0x%x -> dstSet=%d dstWay=%d (victimTag=0x%x victimDirty=%d victimValid=%d)\n",
+           schedule.migrate.bits.srcSet, schedule.migrate.bits.srcWay, schedule.migrate.bits.srcTag,
+           schedule.migrate.bits.dstSet, schedule.migrate.bits.dstWay,
+           schedule.migrate.bits.dstVictimTag, schedule.migrate.bits.dstVictimDirty, schedule.migrate.bits.dstVictimValid)
+  }
+
   // Performance monitoring - track directory access and hit/miss
   io.perf.access_valid := directory.io.result.valid
   io.perf.access_hit := directory.io.result.valid && directory.io.result.bits.hit
+
+  // Saturation counters are now managed inside Directory module
+  // Connect directory's saturation counters to scheduler's output port
+  io.satCounters := directory.io.satCounters
 
   private def afmt(x: AddressSet) = s"""{"base":${x.base},"mask":${x.mask}}"""
   private def addresses = params.inner.manager.managers.flatMap(_.address).map(afmt _).mkString(",")

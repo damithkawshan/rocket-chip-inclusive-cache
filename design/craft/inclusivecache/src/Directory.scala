@@ -32,6 +32,8 @@ class DirectoryEntry(params: InclusiveCacheParameters) extends InclusiveCacheBun
   val state   = UInt(params.stateBits.W)
   val clients = UInt(params.clientBits.W)
   val tag     = UInt(params.tagBits.W)
+  // SSBC: displaced bit - true if line was displaced here from its partner set
+  val displaced = Bool()  // d=0: native to this set, d=1: displaced from partner set
 }
 
 class DirectoryWrite(params: InclusiveCacheParameters) extends InclusiveCacheBundle(params)
@@ -51,6 +53,28 @@ class DirectoryResult(params: InclusiveCacheParameters) extends DirectoryEntry(p
 {
   val hit = Bool()
   val way = UInt(params.wayBits.W)
+  val set = UInt(params.setBits.W)
+  // Migration info: if true, evicting line should migrate to partner set
+  val shouldMigrate = Bool()
+  val partnerSet = UInt(params.setBits.W)
+  val partnerWay = UInt(params.wayBits.W)  // LRU victim way in partner set for migration
+}
+
+// Request to lookup partner set for migration
+class PartnerLookupRequest(params: InclusiveCacheParameters) extends InclusiveCacheBundle(params)
+{
+  val set = UInt(params.setBits.W)  // The partner set to lookup
+}
+
+// Result of partner set lookup - provides victim way for migration
+class PartnerLookupResult(params: InclusiveCacheParameters) extends InclusiveCacheBundle(params)
+{
+  val way = UInt(params.wayBits.W)
+  val victimTag = UInt(params.tagBits.W)
+  val victimDirty = Bool()
+  val victimValid = Bool()
+  val victimClients = UInt(params.clientBits.W)
+  val victimState = UInt(params.stateBits.W)
 }
 
 class Directory(params: InclusiveCacheParameters) extends Module
@@ -60,7 +84,34 @@ class Directory(params: InclusiveCacheParameters) extends Module
     val read   = Flipped(Valid(new DirectoryRead(params))) // sees same-cycle write
     val result = Valid(new DirectoryResult(params))
     val ready  = Bool() // reset complete; can enable access
+    // Saturation counters output (one per set)
+    val satCounters = Output(Vec(params.cache.sets, UInt(log2Ceil(2 * params.cache.ways).W)))
+    // Second search bits output (one per set) - SSBC algorithm
+    val secondSearch = Output(Vec(params.cache.sets, Bool()))
+    // Partner set lookup for migration
+    val partnerLookup = Flipped(Valid(new PartnerLookupRequest(params)))
+    val partnerResult = Valid(new PartnerLookupResult(params))
   })
+
+  // SSBC Saturation counter parameters
+  // Range: 0 to 2K-1 where K is associativity (number of ways)
+  val K = params.cache.ways
+  val satCounterMax = (2 * K - 1).U
+  val satCounterWidth = log2Ceil(2 * K)
+  // Displacement thresholds per SSBC paper:
+  // - Source set eligible to displace only if counter at maximum (2K-1)
+  // - Destination set is good receiver if counter < K
+  val satCounterHighThreshold = satCounterMax  // Must be at max to displace
+  val satCounterLowThreshold = K.U             // Must be below K to receive
+  
+  // Saturation counters - one per set, range [0, 2K-1]
+  val satCounters = RegInit(VecInit(Seq.fill(params.cache.sets)(0.U(satCounterWidth.W))))
+  io.satCounters := satCounters
+  
+  // SSBC Second search bits - one per set
+  // sc[i] = 1 means: the partner set of i may hold displaced lines belonging to set i
+  val secondSearchBits = RegInit(VecInit(Seq.fill(params.cache.sets)(false.B)))
+  io.secondSearch := secondSearchBits
 
   val codeBits = new DirectoryEntry(params).getWidth
 
@@ -131,11 +182,153 @@ class Directory(params: InclusiveCacheParameters) extends Module
     w.tag === tag && w.state =/= INVALID && (!setQuash || i.U =/= bypass.way)
   }.reverse)
   val hit = hits.orR
+  
+  // Calculate partner set by inverting MSB
+  // Ex: Set 000010 partner: 100010, Set 001010 partner: 101010
+  val partnerSet = Cat(~set(params.setBits-1), set(params.setBits-2, 0))
+  
+  // Get saturation counters for current set and partner set
+  val currentSetCounter = satCounters(set)
+  val partnerSetCounter = satCounters(partnerSet)
+  
+  // Determine if evicting line should migrate to partner set (SSBC algorithm)
+  // Conditions per SSBC paper:
+  //   1) This is a miss (eviction will happen)
+  //   2) Current set is at maximum saturation (counter == 2K-1)
+  //   3) Partner set is underutilized (counter < K)
+  //   4) The victim way has valid data to migrate
+  val victimEntry = Mux(setQuash && (tagMatch || wayMatch), bypass.data, Mux1H(victimWayOH, ways))
+  val victimValid = victimEntry.state =/= INVALID
+  val isEviction = !hit && !(setQuash && tagMatch && bypass.data.state =/= INVALID)
+  // TODO: Migration/displacement is disabled until full implementation is complete
+  // When enabled, the condition should be:
+  // val shouldMigrate = isEviction && victimValid &&
+  //                     (currentSetCounter === satCounterHighThreshold) &&  // at max (2K-1)
+  //                     (partnerSetCounter < satCounterLowThreshold)         // below K
+  val shouldMigrate = false.B  // Disabled - displacement logic not fully implemented
 
   io.result.valid := ren2
   io.result.bits.viewAsSupertype(chiselTypeOf(bypass.data)) := Mux(hit, Mux1H(hits, ways), Mux(setQuash && (tagMatch || wayMatch), bypass.data, Mux1H(victimWayOH, ways)))
   io.result.bits.hit := hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
   io.result.bits.way := Mux(hit, OHToUInt(hits), Mux(setQuash && tagMatch, bypass.way, victimWay))
+  io.result.bits.set := set
+  io.result.bits.shouldMigrate := shouldMigrate
+  io.result.bits.partnerSet := partnerSet
+  io.result.bits.partnerWay := victimWay  // Use same random way selection for partner
+  
+  // Partner set lookup logic for migration
+  // This uses a separate read path to lookup the partner set's victim
+  val pren = io.partnerLookup.valid && wipeDone && !ren  // Only when not doing normal read
+  val pren1 = RegInit(false.B)
+  val pren2 = if (params.micro.dirReg) RegInit(false.B) else pren1
+  pren2 := pren1
+  pren1 := pren
+  
+  val partnerLookupSet = RegEnable(io.partnerLookup.bits.set, pren)
+  val partnerRegout = params.dirReg(cc_dir.read(io.partnerLookup.bits.set, pren), pren1)
+  
+  // Compute victim way for partner set using same LFSR-based selection
+  val partnerVictimLFSR = random.LFSR(width = 16, params.dirReg(pren))(InclusiveCacheParameters.lfsrBits-1, 0)
+  val partnerVictimSums = Seq.tabulate(params.cache.ways) { i => ((1 << InclusiveCacheParameters.lfsrBits)*i / params.cache.ways).U }
+  val partnerVictimLTE = Cat(partnerVictimSums.map { _ <= partnerVictimLFSR }.reverse)
+  val partnerVictimSimp = Cat(0.U(1.W), partnerVictimLTE(params.cache.ways-1, 1), 1.U(1.W))
+  val partnerVictimWayOH = partnerVictimSimp(params.cache.ways-1,0) & ~(partnerVictimSimp >> 1)
+  val partnerVictimWay = OHToUInt(partnerVictimWayOH)
+  
+  val partnerWays = partnerRegout.map(d => d.asTypeOf(new DirectoryEntry(params)))
+  val partnerVictimEntry = Mux1H(partnerVictimWayOH, partnerWays)
+  
+  // Handle bypass for partner lookup
+  val partnerBypassValid = params.dirReg(write.valid)
+  val partnerBypass = params.dirReg(write.bits, pren1 && write.valid)
+  val partnerSetQuash = partnerBypassValid && partnerBypass.set === partnerLookupSet
+  val partnerWayMatch = partnerBypass.way === partnerVictimWay
+  
+  io.partnerResult.valid := pren2
+  io.partnerResult.bits.way := partnerVictimWay
+  io.partnerResult.bits.victimTag := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.tag, partnerVictimEntry.tag)
+  io.partnerResult.bits.victimDirty := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.dirty, partnerVictimEntry.dirty)
+  io.partnerResult.bits.victimValid := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.state =/= INVALID, partnerVictimEntry.state =/= INVALID)
+  io.partnerResult.bits.victimClients := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.clients, partnerVictimEntry.clients)
+  io.partnerResult.bits.victimState := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.state, partnerVictimEntry.state)
+  
+  // Update saturation counters on directory access
+  when (ren2) {
+    val accessHit = hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
+    val accessAddr = params.expandAddress(tag, set, 0.U)
+    
+    // Compute partner set (MSB complement for symmetric association)
+    val setBits = params.setBits
+    val partnerSet = Cat(~set(setBits-1), set(setBits-2, 0))
+    val partnerCounter = satCounters(partnerSet)
+    
+    // Status flags for logging
+    val atMax = currentSetCounter === satCounterMax
+    val atZero = currentSetCounter === 0.U
+    val aboveHigh = currentSetCounter >= satCounterHighThreshold
+    val partnerBelowLow = partnerCounter < satCounterLowThreshold
+    val scBit = secondSearchBits(set)
+    val partnerScBit = secondSearchBits(partnerSet)
+    
+    when (accessHit) {
+      // Decrement on hit (saturate at 0)
+      when (currentSetCounter > 0.U) {
+        satCounters(set) := currentSetCounter - 1.U
+        printf("[SSBC] HIT  set=%d cnt=%d->%d | partner=%d cnt=%d | sc=%d psc=%d | K=%d HI=%d LO=%d | addr=0x%x\n",
+               set, currentSetCounter, currentSetCounter - 1.U,
+               partnerSet, partnerCounter,
+               scBit, partnerScBit,
+               K.U, satCounterHighThreshold, satCounterLowThreshold,
+               accessAddr)
+      } .otherwise {
+        printf("[SSBC] HIT  set=%d cnt=%d (at min) | partner=%d cnt=%d | sc=%d psc=%d | addr=0x%x\n",
+               set, currentSetCounter,
+               partnerSet, partnerCounter,
+               scBit, partnerScBit,
+               accessAddr)
+      }
+    } .otherwise {
+      // Increment on miss (saturate at max)
+      when (currentSetCounter < satCounterMax) {
+        satCounters(set) := currentSetCounter + 1.U
+        printf("[SSBC] MISS set=%d cnt=%d->%d | partner=%d cnt=%d | sc=%d psc=%d | K=%d HI=%d LO=%d | addr=0x%x\n",
+               set, currentSetCounter, currentSetCounter + 1.U,
+               partnerSet, partnerCounter,
+               scBit, partnerScBit,
+               K.U, satCounterHighThreshold, satCounterLowThreshold,
+               accessAddr)
+        // Check displacement eligibility after increment
+        when (currentSetCounter + 1.U === satCounterMax && partnerBelowLow) {
+          printf("[SSBC] *** DISPLACEMENT ELIGIBLE: set=%d at max, partner=%d cnt=%d < LO=%d ***\n",
+                 set, partnerSet, partnerCounter, satCounterLowThreshold)
+        }
+      } .otherwise {
+        printf("[SSBC] MISS set=%d cnt=%d (at max=%d) | partner=%d cnt=%d | sc=%d psc=%d | addr=0x%x\n",
+               set, currentSetCounter, satCounterMax,
+               partnerSet, partnerCounter,
+               scBit, partnerScBit,
+               accessAddr)
+        when (partnerBelowLow) {
+          printf("[SSBC] *** DISPLACEMENT ELIGIBLE: set=%d at max, partner=%d cnt=%d < LO=%d ***\n",
+                 set, partnerSet, partnerCounter, satCounterLowThreshold)
+        }
+      }
+      
+      // Log migration decision (currently disabled)
+      when (shouldMigrate) {
+        printf("[SSBC] MIGRATE set=%d -> partner=%d (cnt %d >= HI, partner cnt %d < LO)\n",
+               set, partnerSet, currentSetCounter, partnerCounter)
+      }
+    }
+  }
+  
+  // Log directory writes to track displaced bit
+  when (write.valid && wipeDone) {
+    val writeData = write.bits.data
+    printf("[SSBC] DIR_WRITE set=%d way=%d tag=0x%x state=%d dirty=%d displaced=%d clients=0x%x\n",
+           write.bits.set, write.bits.way, writeData.tag, writeData.state, 
+           writeData.dirty, writeData.displaced, writeData.clients)
+  }
 
   params.ccover(ren2 && setQuash && tagMatch, "DIRECTORY_HIT_BYPASS", "Bypassing write to a directory hit")
   params.ccover(ren2 && setQuash && !tagMatch && wayMatch, "DIRECTORY_EVICT_BYPASS", "Bypassing a write to a directory eviction")

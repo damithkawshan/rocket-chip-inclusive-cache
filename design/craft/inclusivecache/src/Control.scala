@@ -120,7 +120,7 @@ class InclusiveCacheControl(outer: InclusiveCache, control: InclusiveCacheContro
       "Base-2 logarithm of the bytes per cache block", reset=Some(log2Ceil(outer.cache.blockBytes))))
 
     // Bank disable control
-    val bankDisableReg = RegInit(2.U(4.W)) // init value set to 0x10
+    val bankDisableReg = RegInit(0.U(4.W)) // init value set to 0x10
     io.bankDisable := bankDisableReg
     val bankDisableField = RegField(4, bankDisableReg, RegFieldDesc("BankDisable", "4-bit bank disable selector (1=disable)", reset=Some(2)))
   

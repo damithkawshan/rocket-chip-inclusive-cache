@@ -146,6 +146,206 @@ class InclusiveCache(
       scheduler.io.ways := DontCare
       scheduler.io.divs := DontCare
 
+      // Log inner TL channel traffic at the L2 boundary (first beat only).
+      when (in.a.fire) {
+        val prefix = p"[InclusiveCache] L2 bank=$i INNER.A opcode="
+        val suffix = p" param=${in.a.bits.param} size=${in.a.bits.size} source=${in.a.bits.source} " +
+          p"address=0x${Hexadecimal(in.a.bits.address)}\n"
+        when (in.a.bits.opcode === TLMessages.AcquireBlock) {
+          printf(prefix + "AcquireBlock" + suffix)
+        }.elsewhen (in.a.bits.opcode === TLMessages.AcquirePerm) {
+          printf(prefix + "AcquirePerm" + suffix)
+        }.elsewhen (in.a.bits.opcode === TLMessages.ArithmeticData) {
+          printf(prefix + "ArithmeticData" + suffix)
+        }.elsewhen (in.a.bits.opcode === TLMessages.LogicalData) {
+          printf(prefix + "LogicalData" + suffix)
+        }.elsewhen (in.a.bits.opcode === TLMessages.Get) {
+          printf(prefix + "Get" + suffix)
+        }.elsewhen (in.a.bits.opcode === TLMessages.Hint) {
+          printf(prefix + "Hint" + suffix)
+        }.elsewhen (in.a.bits.opcode === TLMessages.PutFullData) {
+          printf(prefix + "PutFullData" + suffix)
+        }.elsewhen (in.a.bits.opcode === TLMessages.PutPartialData) {
+          printf(prefix + "PutPartialData" + suffix)
+        }.otherwise {
+          printf(prefix + "unknown" + suffix)
+        }
+      }
+
+      when (in.b.fire) {
+        val prefix = p"[InclusiveCache] L2 bank=$i INNER.B opcode="
+        val suffix = p" param=${in.b.bits.param} size=${in.b.bits.size} source=${in.b.bits.source} " +
+          p"address=0x${Hexadecimal(in.b.bits.address)}\n"
+        when (in.b.bits.opcode === TLMessages.PutFullData) {
+          printf(prefix + "PutFullData" + suffix)
+        }.elsewhen (in.b.bits.opcode === TLMessages.PutPartialData) {
+          printf(prefix + "PutPartialData" + suffix)
+        }.elsewhen (in.b.bits.opcode === TLMessages.ArithmeticData) {
+          printf(prefix + "ArithmeticData" + suffix)
+        }.elsewhen (in.b.bits.opcode === TLMessages.LogicalData) {
+          printf(prefix + "LogicalData" + suffix)
+        }.elsewhen (in.b.bits.opcode === TLMessages.Get) {
+          printf(prefix + "Get" + suffix)
+        }.elsewhen (in.b.bits.opcode === TLMessages.Hint) {
+          printf(prefix + "Hint" + suffix)
+        }.elsewhen (in.b.bits.opcode === TLMessages.Probe) {
+          printf(prefix + "Probe" + suffix)
+        }.otherwise {
+          printf(prefix + "unknown" + suffix)
+        }
+      }
+
+      when (in.c.fire) {
+        val prefix = p"[InclusiveCache] L2 bank=$i INNER.C opcode="
+        val suffix = p" param=${in.c.bits.param} size=${in.c.bits.size} source=${in.c.bits.source} " +
+          p"address=0x${Hexadecimal(in.c.bits.address)}\n"
+        when (in.c.bits.opcode === TLMessages.AccessAck) {
+          printf(prefix + "AccessAck" + suffix)
+        }.elsewhen (in.c.bits.opcode === TLMessages.AccessAckData) {
+          printf(prefix + "AccessAckData" + suffix)
+        }.elsewhen (in.c.bits.opcode === TLMessages.HintAck) {
+          printf(prefix + "HintAck" + suffix)
+        }.elsewhen (in.c.bits.opcode === TLMessages.ProbeAck) {
+          printf(prefix + "ProbeAck" + suffix)
+        }.elsewhen (in.c.bits.opcode === TLMessages.ProbeAckData) {
+          printf(prefix + "ProbeAckData" + suffix)
+        }.elsewhen (in.c.bits.opcode === TLMessages.Release) {
+          printf(prefix + "Release" + suffix)
+        }.elsewhen (in.c.bits.opcode === TLMessages.ReleaseData) {
+          printf(prefix + "ReleaseData" + suffix)
+        }.otherwise {
+          printf(prefix + "unknown" + suffix)
+        }
+      }
+
+      when (in.d.fire) {
+        val (_, last, _, beat) = edgeIn.count(in.d)
+        val prefix = p"[InclusiveCache] L2 bank=$i INNER.D opcode="
+        val suffix = p" param=${in.d.bits.param} size=${in.d.bits.size} source=${in.d.bits.source} sink=${in.d.bits.sink} beat=${beat} last=${last}\n"
+        when (in.d.bits.opcode === TLMessages.AccessAck) {
+          printf(prefix + "AccessAck" + suffix)
+        }.elsewhen (in.d.bits.opcode === TLMessages.AccessAckData) {
+          printf(prefix + "AccessAckData" + suffix)
+        }.elsewhen (in.d.bits.opcode === TLMessages.Grant) {
+          printf(prefix + "Grant" + suffix)
+        }.elsewhen (in.d.bits.opcode === TLMessages.GrantData) {
+          printf(prefix + "GrantData" + suffix)
+        }.elsewhen (in.d.bits.opcode === TLMessages.ReleaseAck) {
+          printf(prefix + "ReleaseAck" + suffix)
+        }.elsewhen (in.d.bits.opcode === TLMessages.HintAck) {
+          printf(prefix + "HintAck" + suffix)
+        }.otherwise {
+          printf(prefix + "unknown" + suffix)
+        }
+      }
+
+      when (in.e.fire) {
+        val (_, last, _, beat) = edgeIn.count(in.e)
+        val prefix = p"[InclusiveCache] L2 bank=$i INNER.E opcode="
+        val suffix = p" sink=${in.e.bits.sink} beat=${beat} last=${last}\n"
+        printf(prefix + "GrantAck" + suffix)
+      }
+
+      // Log outer TL channel traffic (L2 <-> memory side, first beat only).
+      when (out.a.fire) {
+        val prefix = p"[InclusiveCache] L2 bank=$i OUTER.A opcode="
+        val suffix = p" param=${out.a.bits.param} size=${out.a.bits.size} source=${out.a.bits.source} " +
+          p"address=0x${Hexadecimal(out.a.bits.address)}\n"
+        when (out.a.bits.opcode === TLMessages.AcquireBlock) {
+          printf(prefix + "AcquireBlock" + suffix)
+        }.elsewhen (out.a.bits.opcode === TLMessages.AcquirePerm) {
+          printf(prefix + "AcquirePerm" + suffix)
+        }.elsewhen (out.a.bits.opcode === TLMessages.PutFullData) {
+          printf(prefix + "PutFullData" + suffix)
+        }.elsewhen (out.a.bits.opcode === TLMessages.PutPartialData) {
+          printf(prefix + "PutPartialData" + suffix)
+        }.elsewhen (out.a.bits.opcode === TLMessages.ArithmeticData) {
+          printf(prefix + "ArithmeticData" + suffix)
+        }.elsewhen (out.a.bits.opcode === TLMessages.LogicalData) {
+          printf(prefix + "LogicalData" + suffix)
+        }.elsewhen (out.a.bits.opcode === TLMessages.Get) {
+          printf(prefix + "Get" + suffix)
+        }.elsewhen (out.a.bits.opcode === TLMessages.Hint) {
+          printf(prefix + "Hint" + suffix)
+        }.otherwise {
+          printf(prefix + "unknown" + suffix)
+        }
+      }
+
+      when (out.b.fire) {
+        val prefix = p"[InclusiveCache] L2 bank=$i OUTER.B opcode="
+        val suffix = p" param=${out.b.bits.param} size=${out.b.bits.size} source=${out.b.bits.source} " +
+          p"address=0x${Hexadecimal(out.b.bits.address)}\n"
+        when (out.b.bits.opcode === TLMessages.PutFullData) {
+          printf(prefix + "PutFullData" + suffix)
+        }.elsewhen (out.b.bits.opcode === TLMessages.PutPartialData) {
+          printf(prefix + "PutPartialData" + suffix)
+        }.elsewhen (out.b.bits.opcode === TLMessages.ArithmeticData) {
+          printf(prefix + "ArithmeticData" + suffix)
+        }.elsewhen (out.b.bits.opcode === TLMessages.LogicalData) {
+          printf(prefix + "LogicalData" + suffix)
+        }.elsewhen (out.b.bits.opcode === TLMessages.Get) {
+          printf(prefix + "Get" + suffix)
+        }.elsewhen (out.b.bits.opcode === TLMessages.Hint) {
+          printf(prefix + "Hint" + suffix)
+        }.elsewhen (out.b.bits.opcode === TLMessages.Probe) {
+          printf(prefix + "Probe" + suffix)
+        }.otherwise {
+          printf(prefix + "unknown" + suffix)
+        }
+      }
+
+      when (out.c.fire) {
+        val prefix = p"[InclusiveCache] L2 bank=$i OUTER.C opcode="
+        val suffix = p" param=${out.c.bits.param} size=${out.c.bits.size} source=${out.c.bits.source} " +
+          p"address=0x${Hexadecimal(out.c.bits.address)}\n"
+        when (out.c.bits.opcode === TLMessages.AccessAck) {
+          printf(prefix + "AccessAck" + suffix)
+        }.elsewhen (out.c.bits.opcode === TLMessages.AccessAckData) {
+          printf(prefix + "AccessAckData" + suffix)
+        }.elsewhen (out.c.bits.opcode === TLMessages.HintAck) {
+          printf(prefix + "HintAck" + suffix)
+        }.elsewhen (out.c.bits.opcode === TLMessages.ProbeAck) {
+          printf(prefix + "ProbeAck" + suffix)
+        }.elsewhen (out.c.bits.opcode === TLMessages.ProbeAckData) {
+          printf(prefix + "ProbeAckData" + suffix)
+        }.elsewhen (out.c.bits.opcode === TLMessages.Release) {
+          printf(prefix + "Release" + suffix)
+        }.elsewhen (out.c.bits.opcode === TLMessages.ReleaseData) {
+          printf(prefix + "ReleaseData" + suffix)
+        }.otherwise {
+          printf(prefix + "unknown" + suffix)
+        }
+      }
+
+      when (out.d.fire) {
+        val (_, last, _, beat) = edgeOut.count(out.d)
+        val prefix = p"[InclusiveCache] L2 bank=$i OUTER.D opcode="
+        val suffix = p" param=${out.d.bits.param} size=${out.d.bits.size} source=${out.d.bits.source} sink=${out.d.bits.sink} beat=${beat} last=${last}\n"
+        when (out.d.bits.opcode === TLMessages.AccessAck) {
+          printf(prefix + "AccessAck" + suffix)
+        }.elsewhen (out.d.bits.opcode === TLMessages.AccessAckData) {
+          printf(prefix + "AccessAckData" + suffix)
+        }.elsewhen (out.d.bits.opcode === TLMessages.HintAck) {
+          printf(prefix + "HintAck" + suffix)
+        }.elsewhen (out.d.bits.opcode === TLMessages.Grant) {
+          printf(prefix + "Grant" + suffix)
+        }.elsewhen (out.d.bits.opcode === TLMessages.GrantData) {
+          printf(prefix + "GrantData" + suffix)
+        }.elsewhen (out.d.bits.opcode === TLMessages.ReleaseAck) {
+          printf(prefix + "ReleaseAck" + suffix)
+        }.otherwise {
+          printf(prefix + "unknown" + suffix)
+        }
+      }
+
+      when (out.e.fire) {
+        val (_, last, _, beat) = edgeOut.count(out.e)
+        val prefix = p"[InclusiveCache] L2 bank=$i OUTER.E opcode="
+        val suffix = p" sink=${out.e.bits.sink} beat=${beat} last=${last}\n"
+        printf(prefix + "GrantAck" + suffix)
+      }
+
       // Tie down default values in case there is no controller
       scheduler.io.req.valid := false.B
       scheduler.io.req.bits.address := 0.U
@@ -164,6 +364,12 @@ class InclusiveCache(
       out.a.bits.address := params.restoreAddress(scheduler.io.out.a.bits.address)
       in .b.bits.address := params.restoreAddress(scheduler.io.in .b.bits.address)
       out.c.bits.address := params.restoreAddress(scheduler.io.out.c.bits.address)
+
+      // Integrate TLMonitor for debug
+      val monitor = Module(new freechips.rocketchip.tilelink.TLMonitor(
+        freechips.rocketchip.tilelink.TLMonitorArgs(edgeIn)
+      ))
+      monitor.io.in := in
 
       scheduler
     }

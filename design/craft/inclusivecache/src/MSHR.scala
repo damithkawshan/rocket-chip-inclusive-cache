@@ -306,6 +306,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
       final_meta_writeback.clients := meta.clients & ~probes_toN
     }
     final_meta_writeback.hit := false.B
+    final_meta_writeback.source := 0.U
   } .otherwise {
     final_meta_writeback.dirty := (meta.hit && meta.dirty) || !request.opcode(2)
     final_meta_writeback.state := Mux(req_needT,
@@ -323,6 +324,9 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     // For normal allocation, line is native (not displaced from partner set)
     // TODO: Set to true.B when implementing SSBC displacement logic for lines migrated from partner
     final_meta_writeback.displaced := false.B
+    when (request.prio(0)) {
+      final_meta_writeback.source := request.source
+    }
   }
 
   when (bad_grant) {
@@ -339,6 +343,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
       final_meta_writeback.dirty   := false.B
       final_meta_writeback.state   := INVALID
       final_meta_writeback.clients := 0.U
+      final_meta_writeback.source  := 0.U
     }
   }
 
@@ -348,6 +353,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   invalid.clients := 0.U
   invalid.tag     := 0.U
   invalid.displaced := false.B  // SSBC: invalid entries are not displaced
+  invalid.source  := 0.U
 
   // Just because a client says BtoT, by the time we process the request he may be N.
   // Therefore, we must consult our own meta-data state to confirm he owns the line still.

@@ -299,6 +299,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   directory.io.read.valid := mshr_uses_directory || alloc_uses_directory
   directory.io.read.bits.set := Mux(mshr_uses_directory_for_lb, scheduleSet,          request.bits.set)
   directory.io.read.bits.tag := Mux(mshr_uses_directory_for_lb, requests.io.data.tag, request.bits.tag)
+  directory.io.read.bits.source := Mux(mshr_uses_directory_for_lb, requests.io.data.source, request.bits.source)
 
   // Enqueue the request if not bypassed directly into an MSHR
   requests.io.push.valid := request.valid && queue && !bypassQueue

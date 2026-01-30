@@ -34,6 +34,8 @@ class DirectoryEntry(params: InclusiveCacheParameters) extends InclusiveCacheBun
   val tag     = UInt(params.tagBits.W)
   // SSBC: displaced bit - true if line was displaced here from its partner set
   val displaced = Bool()  // d=0: native to this set, d=1: displaced from partner set
+  // Source ID of the last writer (TileLink A-channel source)
+  val source  = UInt(params.inner.bundle.sourceBits.W)
 }
 
 class DirectoryWrite(params: InclusiveCacheParameters) extends InclusiveCacheBundle(params)
@@ -47,6 +49,7 @@ class DirectoryRead(params: InclusiveCacheParameters) extends InclusiveCacheBund
 {
   val set = UInt(params.setBits.W)
   val tag = UInt(params.tagBits.W)
+  val source = UInt(params.inner.bundle.sourceBits.W)
 }
 
 class DirectoryResult(params: InclusiveCacheParameters) extends DirectoryEntry(params)
@@ -161,6 +164,7 @@ class Directory(params: InclusiveCacheParameters) extends Module
   val regout = params.dirReg(cc_dir.read(io.read.bits.set, ren), ren1)
   val tag = params.dirReg(RegEnable(io.read.bits.tag, ren), ren1)
   val set = params.dirReg(RegEnable(io.read.bits.set, ren), ren1)
+  val reqSource = params.dirReg(RegEnable(io.read.bits.source, ren), ren1)
 
   // Compute the victim way in case of an evicition
   val victimLFSR = random.LFSR(width = 16, params.dirReg(ren))(InclusiveCacheParameters.lfsrBits-1, 0)
@@ -200,19 +204,18 @@ class Directory(params: InclusiveCacheParameters) extends Module
   val victimEntry = Mux(setQuash && (tagMatch || wayMatch), bypass.data, Mux1H(victimWayOH, ways))
   val victimValid = victimEntry.state =/= INVALID
   val isEviction = !hit && !(setQuash && tagMatch && bypass.data.state =/= INVALID)
-  // TODO: Migration/displacement is disabled until full implementation is complete
-  // When enabled, the condition should be:
-  // val shouldMigrate = isEviction && victimValid &&
-  //                     (currentSetCounter === satCounterHighThreshold) &&  // at max (2K-1)
-  //                     (partnerSetCounter < satCounterLowThreshold)         // below K
-  val shouldMigrate = false.B  // Disabled - displacement logic not fully implemented
+  val hitEntry = Mux(setQuash && tagMatch, bypass.data, Mux1H(hits, ways))
+  // Enable SSBC migration/displacement logic
+  val shouldMigrate = isEviction && victimValid &&
+                      (currentSetCounter === satCounterHighThreshold) &&  // at max (2K-1)
+                      (partnerSetCounter < satCounterLowThreshold)         // below K
 
   io.result.valid := ren2
   io.result.bits.viewAsSupertype(chiselTypeOf(bypass.data)) := Mux(hit, Mux1H(hits, ways), Mux(setQuash && (tagMatch || wayMatch), bypass.data, Mux1H(victimWayOH, ways)))
   io.result.bits.hit := hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
   io.result.bits.way := Mux(hit, OHToUInt(hits), Mux(setQuash && tagMatch, bypass.way, victimWay))
   io.result.bits.set := set
-  io.result.bits.shouldMigrate := shouldMigrate
+  io.result.bits.shouldMigrate := false.B // Temporarily disable migration indication
   io.result.bits.partnerSet := partnerSet
   io.result.bits.partnerWay := victimWay  // Use same random way selection for partner
   
@@ -274,16 +277,18 @@ class Directory(params: InclusiveCacheParameters) extends Module
       // Decrement on hit (saturate at 0)
       when (currentSetCounter > 0.U) {
         satCounters(set) := currentSetCounter - 1.U
-        printf("[SSBC] HIT  set=%d cnt=%d->%d | partner=%d cnt=%d | sc=%d psc=%d | K=%d HI=%d LO=%d | addr=0x%x\n",
+        printf("[SSBC] HIT  set=%d cnt=%d->%d | partner=%d cnt=%d | req_src=%d line_src=%d | sc=%d psc=%d | K=%d HI=%d LO=%d | addr=0x%x\n",
                set, currentSetCounter, currentSetCounter - 1.U,
                partnerSet, partnerCounter,
+               reqSource, hitEntry.source,
                scBit, partnerScBit,
                K.U, satCounterHighThreshold, satCounterLowThreshold,
                accessAddr)
       } .otherwise {
-        printf("[SSBC] HIT  set=%d cnt=%d (at min) | partner=%d cnt=%d | sc=%d psc=%d | addr=0x%x\n",
+        printf("[SSBC] HIT  set=%d cnt=%d (at min) | partner=%d cnt=%d | req_src=%d line_src=%d | sc=%d psc=%d | addr=0x%x\n",
                set, currentSetCounter,
                partnerSet, partnerCounter,
+               reqSource, hitEntry.source,
                scBit, partnerScBit,
                accessAddr)
       }
@@ -291,9 +296,10 @@ class Directory(params: InclusiveCacheParameters) extends Module
       // Increment on miss (saturate at max)
       when (currentSetCounter < satCounterMax) {
         satCounters(set) := currentSetCounter + 1.U
-        printf("[SSBC] MISS set=%d cnt=%d->%d | partner=%d cnt=%d | sc=%d psc=%d | K=%d HI=%d LO=%d | addr=0x%x\n",
+        printf("[SSBC] MISS set=%d cnt=%d->%d | partner=%d cnt=%d | req_src=%d victim_src=%d victim_valid=%d | sc=%d psc=%d | K=%d HI=%d LO=%d | addr=0x%x\n",
                set, currentSetCounter, currentSetCounter + 1.U,
                partnerSet, partnerCounter,
+               reqSource, victimEntry.source, victimValid,
                scBit, partnerScBit,
                K.U, satCounterHighThreshold, satCounterLowThreshold,
                accessAddr)
@@ -303,9 +309,10 @@ class Directory(params: InclusiveCacheParameters) extends Module
                  set, partnerSet, partnerCounter, satCounterLowThreshold)
         }
       } .otherwise {
-        printf("[SSBC] MISS set=%d cnt=%d (at max=%d) | partner=%d cnt=%d | sc=%d psc=%d | addr=0x%x\n",
+        printf("[SSBC] MISS set=%d cnt=%d (at max=%d) | partner=%d cnt=%d | req_src=%d victim_src=%d victim_valid=%d | sc=%d psc=%d | addr=0x%x\n",
                set, currentSetCounter, satCounterMax,
                partnerSet, partnerCounter,
+               reqSource, victimEntry.source, victimValid,
                scBit, partnerScBit,
                accessAddr)
         when (partnerBelowLow) {
@@ -325,9 +332,9 @@ class Directory(params: InclusiveCacheParameters) extends Module
   // Log directory writes to track displaced bit
   when (write.valid && wipeDone) {
     val writeData = write.bits.data
-    printf("[SSBC] DIR_WRITE set=%d way=%d tag=0x%x state=%d dirty=%d displaced=%d clients=0x%x\n",
+    printf("[SSBC] DIR_WRITE set=%d way=%d tag=0x%x state=%d dirty=%d displaced=%d source=%d clients=0x%x\n",
            write.bits.set, write.bits.way, writeData.tag, writeData.state, 
-           writeData.dirty, writeData.displaced, writeData.clients)
+           writeData.dirty, writeData.displaced, writeData.source, writeData.clients)
   }
 
   params.ccover(ren2 && setQuash && tagMatch, "DIRECTORY_HIT_BYPASS", "Bypassing write to a directory hit")

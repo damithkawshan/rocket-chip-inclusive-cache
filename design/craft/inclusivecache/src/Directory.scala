@@ -34,6 +34,8 @@ class DirectoryEntry(params: InclusiveCacheParameters) extends InclusiveCacheBun
   val tag     = UInt(params.tagBits.W)
   // SSBC: displaced bit - true if line was displaced here from its partner set
   val displaced = Bool()  // d=0: native to this set, d=1: displaced from partner set
+  // SSBC: origin set (logical home set for a displaced line)
+  val originSet = UInt(params.setBits.W)
   // Source ID of the last writer (TileLink A-channel source)
   val source  = UInt(params.inner.bundle.sourceBits.W)
 }
@@ -57,10 +59,18 @@ class DirectoryResult(params: InclusiveCacheParameters) extends DirectoryEntry(p
   val hit = Bool()
   val way = UInt(params.wayBits.W)
   val set = UInt(params.setBits.W)
+  // SSBC visibility for controller
+  val scBit = Bool()
+  val partnerScBit = Bool()
+  val currentSat = UInt(log2Ceil(2 * params.cache.ways).W)
+  val partnerSat = UInt(log2Ceil(2 * params.cache.ways).W)
   // Migration info: if true, evicting line should migrate to partner set
   val shouldMigrate = Bool()
   val partnerSet = UInt(params.setBits.W)
   val partnerWay = UInt(params.wayBits.W)  // LRU victim way in partner set for migration
+  // SSBC: secondary search control/summary
+  val secondaryHit = Bool()
+  val secondaryWay = UInt(params.wayBits.W)
 }
 
 // Request to lookup partner set for migration
@@ -82,6 +92,8 @@ class PartnerLookupResult(params: InclusiveCacheParameters) extends InclusiveCac
 
 class Directory(params: InclusiveCacheParameters) extends Module
 {
+  val ssbcEnabled = params.cache.ssbcEnabled.B
+
   val io = IO(new Bundle {
     val write  = Flipped(Decoupled(new DirectoryWrite(params)))
     val read   = Flipped(Valid(new DirectoryRead(params))) // sees same-cycle write
@@ -186,14 +198,18 @@ class Directory(params: InclusiveCacheParameters) extends Module
     w.tag === tag && w.state =/= INVALID && (!setQuash || i.U =/= bypass.way)
   }.reverse)
   val hit = hits.orR
+  // Use original hit logic for functional behavior (match upstream);
+  // bypassed same-cycle writes are not treated as hits here.
+  val primaryHit = hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
+  val primaryMiss = !primaryHit
   
   // Calculate partner set by inverting MSB
   // Ex: Set 000010 partner: 100010, Set 001010 partner: 101010
   val partnerSet = Cat(~set(params.setBits-1), set(params.setBits-2, 0))
   
   // Get saturation counters for current set and partner set
-  val currentSetCounter = satCounters(set)
-  val partnerSetCounter = satCounters(partnerSet)
+  val currentSatCounter = satCounters(set)
+  val partnerSatCounter = satCounters(partnerSet)
   
   // Determine if evicting line should migrate to partner set (SSBC algorithm)
   // Conditions per SSBC paper:
@@ -201,23 +217,31 @@ class Directory(params: InclusiveCacheParameters) extends Module
   //   2) Current set is at maximum saturation (counter == 2K-1)
   //   3) Partner set is underutilized (counter < K)
   //   4) The victim way has valid data to migrate
-  val victimEntry = Mux(setQuash && (tagMatch || wayMatch), bypass.data, Mux1H(victimWayOH, ways))
-  val victimValid = victimEntry.state =/= INVALID
-  val isEviction = !hit && !(setQuash && tagMatch && bypass.data.state =/= INVALID)
   val hitEntry = Mux(setQuash && tagMatch, bypass.data, Mux1H(hits, ways))
+  val victimEntry = Mux(setQuash && (tagMatch || wayMatch), bypass.data, Mux1H(victimWayOH, ways))
+  val victimValid = victimEntry.state =/= INVALID  // Victim must be valid to migrate
+  val resultEntry = Mux(hit, hitEntry, victimEntry)
+
   // Enable SSBC migration/displacement logic
-  val shouldMigrate = isEviction && victimValid &&
-                      (currentSetCounter === satCounterHighThreshold) &&  // at max (2K-1)
-                      (partnerSetCounter < satCounterLowThreshold)         // below K
+  // Conditions: Miss, Victim Valid, Saturation Thresholds
+  val shouldMigrate = ssbcEnabled && !primaryHit && victimValid &&
+                      (currentSatCounter === satCounterHighThreshold) &&
+                      (partnerSatCounter < satCounterLowThreshold)
 
   io.result.valid := ren2
-  io.result.bits.viewAsSupertype(chiselTypeOf(bypass.data)) := Mux(hit, Mux1H(hits, ways), Mux(setQuash && (tagMatch || wayMatch), bypass.data, Mux1H(victimWayOH, ways)))
+  io.result.bits.viewAsSupertype(chiselTypeOf(bypass.data)) := resultEntry
   io.result.bits.hit := hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
   io.result.bits.way := Mux(hit, OHToUInt(hits), Mux(setQuash && tagMatch, bypass.way, victimWay))
   io.result.bits.set := set
-  io.result.bits.shouldMigrate := false.B // Temporarily disable migration indication
+  io.result.bits.scBit := secondSearchBits(set)
+  io.result.bits.partnerScBit := secondSearchBits(partnerSet)
+  io.result.bits.currentSat := currentSatCounter
+  io.result.bits.partnerSat := partnerSatCounter
+  io.result.bits.shouldMigrate := shouldMigrate
   io.result.bits.partnerSet := partnerSet
   io.result.bits.partnerWay := victimWay  // Use same random way selection for partner
+  io.result.bits.secondaryHit := false.B
+  io.result.bits.secondaryWay := 0.U
   
   // Partner set lookup logic for migration
   // This uses a separate read path to lookup the partner set's victim
@@ -255,9 +279,9 @@ class Directory(params: InclusiveCacheParameters) extends Module
   io.partnerResult.bits.victimClients := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.clients, partnerVictimEntry.clients)
   io.partnerResult.bits.victimState := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.state, partnerVictimEntry.state)
   
-  // Update saturation counters on directory access
-  when (ren2) {
-    val accessHit = hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
+  // Update saturation counters on directory access (primary lookup)
+  when (ren2 && ssbcEnabled) {
+    val accessHit = hit
     val accessAddr = params.expandAddress(tag, set, 0.U)
     
     // Compute partner set (MSB complement for symmetric association)
@@ -266,19 +290,19 @@ class Directory(params: InclusiveCacheParameters) extends Module
     val partnerCounter = satCounters(partnerSet)
     
     // Status flags for logging
-    val atMax = currentSetCounter === satCounterMax
-    val atZero = currentSetCounter === 0.U
-    val aboveHigh = currentSetCounter >= satCounterHighThreshold
+    val atMax = currentSatCounter === satCounterMax
+    val atZero = currentSatCounter === 0.U
+    val aboveHigh = currentSatCounter >= satCounterHighThreshold
     val partnerBelowLow = partnerCounter < satCounterLowThreshold
     val scBit = secondSearchBits(set)
     val partnerScBit = secondSearchBits(partnerSet)
     
     when (accessHit) {
       // Decrement on hit (saturate at 0)
-      when (currentSetCounter > 0.U) {
-        satCounters(set) := currentSetCounter - 1.U
+      when (currentSatCounter > 0.U) {
+        satCounters(set) := currentSatCounter - 1.U
         printf("[SSBC] HIT  set=%d cnt=%d->%d | partner=%d cnt=%d | req_src=%d line_src=%d | sc=%d psc=%d | K=%d HI=%d LO=%d | addr=0x%x\n",
-               set, currentSetCounter, currentSetCounter - 1.U,
+               set, currentSatCounter, currentSatCounter - 1.U,
                partnerSet, partnerCounter,
                reqSource, hitEntry.source,
                scBit, partnerScBit,
@@ -286,7 +310,7 @@ class Directory(params: InclusiveCacheParameters) extends Module
                accessAddr)
       } .otherwise {
         printf("[SSBC] HIT  set=%d cnt=%d (at min) | partner=%d cnt=%d | req_src=%d line_src=%d | sc=%d psc=%d | addr=0x%x\n",
-               set, currentSetCounter,
+               set, currentSatCounter,
                partnerSet, partnerCounter,
                reqSource, hitEntry.source,
                scBit, partnerScBit,
@@ -294,25 +318,25 @@ class Directory(params: InclusiveCacheParameters) extends Module
       }
     } .otherwise {
       // Increment on miss (saturate at max)
-      when (currentSetCounter < satCounterMax) {
-        satCounters(set) := currentSetCounter + 1.U
+      when (currentSatCounter < satCounterMax) {
+        satCounters(set) := currentSatCounter + 1.U
         printf("[SSBC] MISS set=%d cnt=%d->%d | partner=%d cnt=%d | req_src=%d victim_src=%d victim_valid=%d | sc=%d psc=%d | K=%d HI=%d LO=%d | addr=0x%x\n",
-               set, currentSetCounter, currentSetCounter + 1.U,
+               set, currentSatCounter, currentSatCounter + 1.U,
                partnerSet, partnerCounter,
                reqSource, victimEntry.source, victimValid,
                scBit, partnerScBit,
                K.U, satCounterHighThreshold, satCounterLowThreshold,
                accessAddr)
         // Check displacement eligibility after increment
-        when (currentSetCounter + 1.U === satCounterMax && partnerBelowLow) {
+        when (currentSatCounter + 1.U === satCounterMax && partnerBelowLow) {
           printf("[SSBC] *** DISPLACEMENT ELIGIBLE: set=%d at max, partner=%d cnt=%d < LO=%d ***\n",
                  set, partnerSet, partnerCounter, satCounterLowThreshold)
         }
       } .otherwise {
-        printf("[SSBC] MISS set=%d cnt=%d (at max=%d) | partner=%d cnt=%d | req_src=%d victim_src=%d victim_valid=%d | sc=%d psc=%d | addr=0x%x\n",
-               set, currentSetCounter, satCounterMax,
+        printf("[SSBC] MISS set=%d cnt=%d (at max=%d) | partner=%d cnt=%d | req_src=%d victim_src=%d victim_valid=%d victim_tag=0x%x | sc=%d psc=%d | addr=0x%x\n",
+               set, currentSatCounter, satCounterMax,
                partnerSet, partnerCounter,
-               reqSource, victimEntry.source, victimValid,
+               reqSource, victimEntry.source, victimValid, victimEntry.tag,
                scBit, partnerScBit,
                accessAddr)
         when (partnerBelowLow) {
@@ -321,20 +345,41 @@ class Directory(params: InclusiveCacheParameters) extends Module
         }
       }
       
-      // Log migration decision (currently disabled)
+      // Log migration decision
       when (shouldMigrate) {
         printf("[SSBC] MIGRATE set=%d -> partner=%d (cnt %d >= HI, partner cnt %d < LO)\n",
-               set, partnerSet, currentSetCounter, partnerCounter)
+               set, partnerSet, currentSatCounter, partnerCounter)
       }
     }
   }
-  
+
+  // SSBC: sc bit maintenance (set on displaced-line insertion)
+  when (write.valid && wipeDone && ssbcEnabled && write.bits.data.displaced) {
+    secondSearchBits(write.bits.data.originSet) := true.B
+    printf("[SSBC] SC_SET: originSet=%d (displaced line inserted into set %d)\n",
+           write.bits.data.originSet, write.bits.set)
+  }
+
+  // SSBC: conservative sc clear on eviction of last displaced line for an origin set
+  val writeInvalidDisplaced = write.valid && wipeDone && ssbcEnabled &&
+                              write.bits.data.state === INVALID && write.bits.data.displaced
+  when (writeInvalidDisplaced && ren2 && set === write.bits.set) {
+    val remainingForOrigin = Cat(ways.zipWithIndex.map { case (w, i) =>
+      w.state =/= INVALID && w.displaced && (w.originSet === write.bits.data.originSet) && (i.U =/= write.bits.way)
+    }.reverse).orR
+    when (!remainingForOrigin) {
+      secondSearchBits(write.bits.data.originSet) := false.B
+      printf("[SSBC] SC_CLEAR: originSet=%d (no remaining displaced lines in set %d)\n",
+             write.bits.data.originSet, write.bits.set)
+    }
+  }
+
   // Log directory writes to track displaced bit
-  when (write.valid && wipeDone) {
+  when (write.valid && wipeDone && ssbcEnabled) {
     val writeData = write.bits.data
-    printf("[SSBC] DIR_WRITE set=%d way=%d tag=0x%x state=%d dirty=%d displaced=%d source=%d clients=0x%x\n",
+    printf("[SSBC] DIR_WRITE set=%d way=%d tag=0x%x state=%d dirty=%d displaced=%d originSet=%d source=%d clients=0x%x\n",
            write.bits.set, write.bits.way, writeData.tag, writeData.state, 
-           writeData.dirty, writeData.displaced, writeData.source, writeData.clients)
+           writeData.dirty, writeData.displaced, writeData.originSet, writeData.source, writeData.clients)
   }
 
   params.ccover(ren2 && setQuash && tagMatch, "DIRECTORY_HIT_BYPASS", "Bypassing write to a directory hit")

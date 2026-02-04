@@ -324,6 +324,8 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     // For normal allocation, line is native (not displaced from partner set)
     // TODO: Set to true.B when implementing SSBC displacement logic for lines migrated from partner
     final_meta_writeback.displaced := false.B
+    // SSBC: default origin is the request's logical set
+    final_meta_writeback.originSet := request.set
     when (request.prio(0)) {
       final_meta_writeback.source := request.source
     }
@@ -353,6 +355,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   invalid.clients := 0.U
   invalid.tag     := 0.U
   invalid.displaced := false.B  // SSBC: invalid entries are not displaced
+  invalid.originSet := 0.U      // SSBC: no origin for invalid entries
   invalid.source  := 0.U
 
   // Just because a client says BtoT, by the time we process the request he may be N.

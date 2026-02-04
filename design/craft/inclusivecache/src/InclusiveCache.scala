@@ -127,6 +127,12 @@ class InclusiveCache(
     val missCounter = RegInit(0.U(64.W))
     val totalAccessCounter = RegInit(0.U(64.W))
 
+    if (cache.ssbcEnabled) {
+      println(s"[InclusiveCache] L${cache.level} SSBC enabled (sets=${cache.sets}, ways=${cache.ways})")
+    } else {
+      println(s"[InclusiveCache] L${cache.level} SSBC disabled")
+    }
+
     // Create the L2 Banks
     val mods = (node.in zip node.out).zipWithIndex.map { case (((in, edgeIn), (out, edgeOut)), i) =>
       edgeOut.manager.managers.foreach { m =>

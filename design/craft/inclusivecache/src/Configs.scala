@@ -35,6 +35,7 @@ case class InclusiveCacheParams(
   memCycles: Int,  // # of L2 clock cycles for a memory round-trip (50ns @ 800MHz)
   physicalFilter: Option[PhysicalFilterParams] = None,
   hintsSkipProbe: Boolean = false, // do hints probe the same client
+  ssbcEnabled: Boolean = false,    // enable SSBC displacement algorithm
   bankedControl: Boolean = false, // bank the cache ctrl with the cache banks
   ctrlAddr: Option[Int] = Some(InclusiveCacheParameters.L2ControlAddress),
   // Interior/Exterior refer to placement either inside the Scheduler or outside it
@@ -52,6 +53,7 @@ class WithInclusiveCache(
   outerLatencyCycles: Int = 40,
   subBankingFactor: Int = 4,
   hintsSkipProbe: Boolean = false,
+  ssbcEnabled: Boolean = false,
   bankedControl: Boolean = false,
   ctrlAddr: Option[Int] = Some(InclusiveCacheParameters.L2ControlAddress)
 ) extends Config((site, here, up) => {
@@ -62,6 +64,7 @@ class WithInclusiveCache(
       writeBytes = site(MaxXLen)/8,
       portFactor = subBankingFactor,
       hintsSkipProbe = hintsSkipProbe,
+      ssbcEnabled = ssbcEnabled,
       bankedControl = bankedControl,
       ctrlAddr = ctrlAddr)
   case SubsystemBankedCoherenceKey => up(SubsystemBankedCoherenceKey, site).copy(coherenceManager = { context =>
@@ -76,6 +79,7 @@ class WithInclusiveCache(
       memCycles,
       physicalFilter,
       hintsSkipProbe,
+      ssbcEnabled,
       bankedControl,
       ctrlAddr,
       bufInnerInterior,
@@ -96,7 +100,8 @@ class WithInclusiveCache(
         sets = sets,
         blockBytes = sbus.blockBytes,
         beatBytes = sbus.beatBytes,
-        hintsSkipProbe = hintsSkipProbe),
+        hintsSkipProbe = hintsSkipProbe,
+        ssbcEnabled = ssbcEnabled),
       InclusiveCacheMicroParameters(
         writeBytes = writeBytes,
         portFactor = portFactor,

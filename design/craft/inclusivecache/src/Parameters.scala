@@ -32,13 +32,17 @@ case class CacheParameters(
   sets:        Int,
   blockBytes:  Int,
   beatBytes:   Int, // inner
-  hintsSkipProbe: Boolean)
+  hintsSkipProbe: Boolean,
+  // SSBC (Static Set Balancing Cache) parameters
+  ssbcEnabled: Boolean = false)
 {
   require (ways > 0)
   require (sets > 0)
   require (blockBytes > 0 && isPow2(blockBytes))
   require (beatBytes > 0 && isPow2(beatBytes))
   require (blockBytes >= beatBytes)
+  // SSBC requires at least 2 sets for partner pairing (MSB complement)
+  require (!ssbcEnabled || sets >= 2, "SSBC requires at least 2 sets for partner set pairing")
 
   val blocks = ways * sets
   val sizeBytes = blocks * blockBytes

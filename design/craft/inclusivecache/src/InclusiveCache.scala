@@ -155,8 +155,9 @@ class InclusiveCache(
       // Log inner TL channel traffic at the L2 boundary (first beat only).
       when (in.a.fire) {
         val prefix = p"[InclusiveCache] L2 bank=$i INNER.A opcode="
+        val (tag,set,offset) = params.parseAddress(in.a.bits.address)
         val suffix = p" param=${in.a.bits.param} size=${in.a.bits.size} source=${in.a.bits.source} " +
-          p"address=0x${Hexadecimal(in.a.bits.address)}\n"
+          p"address=0x${Hexadecimal(in.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} \n"
         when (in.a.bits.opcode === TLMessages.AcquireBlock) {
           printf(prefix + "AcquireBlock" + suffix)
         }.elsewhen (in.a.bits.opcode === TLMessages.AcquirePerm) {
@@ -180,8 +181,9 @@ class InclusiveCache(
 
       when (in.b.fire) {
         val prefix = p"[InclusiveCache] L2 bank=$i INNER.B opcode="
+        val (tag,set,offset) = params.parseAddress(in.b.bits.address)
         val suffix = p" param=${in.b.bits.param} size=${in.b.bits.size} source=${in.b.bits.source} " +
-          p"address=0x${Hexadecimal(in.b.bits.address)}\n"
+          p"address=0x${Hexadecimal(in.b.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} \n"
         when (in.b.bits.opcode === TLMessages.PutFullData) {
           printf(prefix + "PutFullData" + suffix)
         }.elsewhen (in.b.bits.opcode === TLMessages.PutPartialData) {
@@ -202,9 +204,10 @@ class InclusiveCache(
       }
 
       when (in.c.fire) {
+        val (tag,set,offset) = params.parseAddress(in.c.bits.address)
         val prefix = p"[InclusiveCache] L2 bank=$i INNER.C opcode="
         val suffix = p" param=${in.c.bits.param} size=${in.c.bits.size} source=${in.c.bits.source} " +
-          p"address=0x${Hexadecimal(in.c.bits.address)}\n"
+          p"address=0x${Hexadecimal(in.c.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} \n"
         when (in.c.bits.opcode === TLMessages.AccessAck) {
           printf(prefix + "AccessAck" + suffix)
         }.elsewhen (in.c.bits.opcode === TLMessages.AccessAckData) {
@@ -255,8 +258,9 @@ class InclusiveCache(
       // Log outer TL channel traffic (L2 <-> memory side, first beat only).
       when (out.a.fire) {
         val prefix = p"[InclusiveCache] L2 bank=$i OUTER.A opcode="
+        val (tag,set,offset) = params.parseAddress(out.a.bits.address)
         val suffix = p" param=${out.a.bits.param} size=${out.a.bits.size} source=${out.a.bits.source} " +
-          p"address=0x${Hexadecimal(out.a.bits.address)}\n"
+          p"address=0x${Hexadecimal(out.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} \n"
         when (out.a.bits.opcode === TLMessages.AcquireBlock) {
           printf(prefix + "AcquireBlock" + suffix)
         }.elsewhen (out.a.bits.opcode === TLMessages.AcquirePerm) {
@@ -280,8 +284,9 @@ class InclusiveCache(
 
       when (out.b.fire) {
         val prefix = p"[InclusiveCache] L2 bank=$i OUTER.B opcode="
+        val (tag,set,offset) = params.parseAddress(out.b.bits.address)
         val suffix = p" param=${out.b.bits.param} size=${out.b.bits.size} source=${out.b.bits.source} " +
-          p"address=0x${Hexadecimal(out.b.bits.address)}\n"
+          p"address=0x${Hexadecimal(out.b.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} \n"
         when (out.b.bits.opcode === TLMessages.PutFullData) {
           printf(prefix + "PutFullData" + suffix)
         }.elsewhen (out.b.bits.opcode === TLMessages.PutPartialData) {
@@ -302,9 +307,10 @@ class InclusiveCache(
       }
 
       when (out.c.fire) {
+        val (tag,set,offset) = params.parseAddress(out.c.bits.address)
         val prefix = p"[InclusiveCache] L2 bank=$i OUTER.C opcode="
         val suffix = p" param=${out.c.bits.param} size=${out.c.bits.size} source=${out.c.bits.source} " +
-          p"address=0x${Hexadecimal(out.c.bits.address)}\n"
+          p"address=0x${Hexadecimal(out.c.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} \n"
         when (out.c.bits.opcode === TLMessages.AccessAck) {
           printf(prefix + "AccessAck" + suffix)
         }.elsewhen (out.c.bits.opcode === TLMessages.AccessAckData) {

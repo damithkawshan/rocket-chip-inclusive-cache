@@ -104,6 +104,8 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
     // Connect partner lookup for migration - arbitrate among MSHRs
     m.io.partnerResult.valid := false.B
     m.io.partnerResult.bits := directory.io.partnerResult.bits
+    // Default: no partner read grant
+    m.io.partnerReadGrant := false.B
   }
   
   // Partner lookup arbitration - only one MSHR can use partner lookup at a time
@@ -117,6 +119,16 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
     when (partnerLookupGrant(i) && directory.io.partnerResult.valid) {
       m.io.partnerResult.valid := true.B
     }
+  }
+
+  // Partner read arbitration for SSBC secondary search
+  val partnerReadReqs = mshrs.map(_.io.partnerRead.valid)
+  val partnerReadOH = PriorityEncoderOH(Cat(partnerReadReqs.reverse))
+  val partnerReadAny = partnerReadReqs.reduce(_ || _)
+  val partnerReadFire = partnerReadAny && directory.io.ready
+  val partnerReadBits = Mux1H(partnerReadOH, mshrs.map(_.io.partnerRead.bits))
+  mshrs.zipWithIndex.foreach { case (m, i) =>
+    when (partnerReadFire && partnerReadOH(i)) { m.io.partnerReadGrant := true.B }
   }
 
   // If the pre-emption BC or C MSHR have a matching set, the normal MSHR must be blocked
@@ -246,7 +258,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   val may_pop = a_pop || b_pop || c_pop
   val bypass = request.valid && queue && bypassMatches
   val will_reload = schedule.reload && (may_pop || bypass)
-  val will_pop = schedule.reload && may_pop && !bypass
+  val will_pop = schedule.reload && may_pop && !bypass && !partnerReadFire
 
   params.ccover(mshr_selectOH.orR && bypass, "SCHEDULER_BYPASS", "Bypass new request directly to conflicting MSHR")
   params.ccover(mshr_selectOH.orR && will_reload, "SCHEDULER_RELOAD", "Back-to-back service of two requests")
@@ -263,7 +275,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
                         Mux(c_pop || request.bits.prio(2), !c_pop, Mux(b_pop || request.bits.prio(1), !b_pop, !a_pop))
     val may_pop = a_pop || b_pop || c_pop
     val bypass = request.valid && queue && bypassMatches
-    val will_reload = m.io.schedule.bits.reload && (may_pop || bypass)
+    val will_reload = m.io.schedule.bits.reload && (may_pop || bypass) && !partnerReadFire
     m.io.allocate.bits.viewAsSupertype(chiselTypeOf(requests.io.data)) := Mux(bypass, WireInit(new QueuedRequest(params), init = request.bits), requests.io.data)
     m.io.allocate.bits.set := m.io.status.bits.set
     m.io.allocate.bits.repeat := m.io.allocate.bits.tag === m.io.status.bits.tag
@@ -278,9 +290,9 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
 
   // Reload from the Directory if the next MSHR operation changes tags
   val lb_tag_mismatch = scheduleTag =/= requests.io.data.tag
-  val mshr_uses_directory_assuming_no_bypass = schedule.reload && may_pop && lb_tag_mismatch
+  val mshr_uses_directory_assuming_no_bypass = schedule.reload && may_pop && lb_tag_mismatch && !partnerReadFire
   val mshr_uses_directory_for_lb = will_pop && lb_tag_mismatch
-  val mshr_uses_directory = will_reload && scheduleTag =/= Mux(bypass, request.bits.tag, requests.io.data.tag)
+  val mshr_uses_directory = !partnerReadFire && will_reload && scheduleTag =/= Mux(bypass, request.bits.tag, requests.io.data.tag)
 
   // Is there an MSHR free for this request?
   val mshr_validOH = Cat(mshrs.map(_.io.status.valid).reverse)
@@ -288,21 +300,27 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
 
   // Fanout the request to the appropriate handler (if any)
   val bypassQueue = schedule.reload && bypassMatches
-  val request_alloc_cases =
+  val request_alloc_cases = !partnerReadFire && (
      (alloc && !mshr_uses_directory_assuming_no_bypass && mshr_free) ||
      (nestB && !mshr_uses_directory_assuming_no_bypass && !bc_mshr.io.status.valid && !c_mshr.io.status.valid) ||
-     (nestC && !mshr_uses_directory_assuming_no_bypass && !c_mshr.io.status.valid)
-  request.ready := request_alloc_cases || (queue && (bypassQueue || requests.io.push.ready))
-  val alloc_uses_directory = request.valid && request_alloc_cases
+     (nestC && !mshr_uses_directory_assuming_no_bypass && !c_mshr.io.status.valid))
+  request.ready := !partnerReadFire && (request_alloc_cases || (queue && (bypassQueue || requests.io.push.ready)))
+  val alloc_uses_directory = !partnerReadFire && request.valid && request_alloc_cases
 
   // When a request goes through, it will need to hit the Directory
-  directory.io.read.valid := mshr_uses_directory || alloc_uses_directory
-  directory.io.read.bits.set := Mux(mshr_uses_directory_for_lb, scheduleSet,          request.bits.set)
-  directory.io.read.bits.tag := Mux(mshr_uses_directory_for_lb, requests.io.data.tag, request.bits.tag)
-  directory.io.read.bits.source := Mux(mshr_uses_directory_for_lb, requests.io.data.source, request.bits.source)
+  directory.io.read.valid := partnerReadFire || mshr_uses_directory || alloc_uses_directory
+  directory.io.read.bits.set :=
+    Mux(partnerReadFire, partnerReadBits.set,
+      Mux(mshr_uses_directory_for_lb, scheduleSet, request.bits.set))
+  directory.io.read.bits.tag :=
+    Mux(partnerReadFire, partnerReadBits.tag,
+      Mux(mshr_uses_directory_for_lb, requests.io.data.tag, request.bits.tag))
+  directory.io.read.bits.source :=
+    Mux(partnerReadFire, partnerReadBits.source,
+      Mux(mshr_uses_directory_for_lb, requests.io.data.source, request.bits.source))
 
   // Enqueue the request if not bypassed directly into an MSHR
-  requests.io.push.valid := request.valid && queue && !bypassQueue
+  requests.io.push.valid := request.valid && queue && !bypassQueue && !partnerReadFire
   requests.io.push.bits.data  := request.bits
   requests.io.push.bits.index := Mux1H(
     request.bits.prio, Seq(
@@ -339,11 +357,20 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
 
   // Fanout the result of the Directory lookup
   val dirTarget = Mux(alloc, mshr_insertOH, Mux(nestB,(BigInt(1) << (params.mshrs-2)).U,(BigInt(1) << (params.mshrs-1)).U))
-  val directoryFanout = params.dirReg(RegNext(Mux(mshr_uses_directory, mshr_selectOH, Mux(alloc_uses_directory, dirTarget, 0.U))))
+  val dirReadSel = Mux(partnerReadFire, partnerReadOH,
+                    Mux(mshr_uses_directory, mshr_selectOH,
+                      Mux(alloc_uses_directory, dirTarget, 0.U)))
+  val directoryFanout = params.dirReg(RegNext(dirReadSel))
   mshrs.zipWithIndex.foreach { case (m, i) =>
     m.io.directory.valid := directoryFanout(i)
     m.io.directory.bits := directory.io.result.bits
   }
+
+  // Saturation counter update from MSHRs (at most one per cycle)
+  val satUpdateReqs = mshrs.map(_.io.satUpdate.valid)
+  val satUpdateOH = PriorityEncoderOH(satUpdateReqs)
+  directory.io.satUpdate.valid := satUpdateReqs.reduce(_ || _)
+  directory.io.satUpdate.bits := Mux1H(satUpdateOH, mshrs.map(_.io.satUpdate.bits))
 
   // MSHR response meta-data fetch
   sinkC.io.way :=
@@ -395,7 +422,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   io.perf.access_valid := directory.io.result.valid
   io.perf.access_hit := directory.io.result.valid && directory.io.result.bits.hit
 
-  // Saturation counters are now managed inside Directory module
+  // Saturation counters are stored in Directory module
   // Connect directory's saturation counters to scheduler's output port
   io.satCounters := directory.io.satCounters
 

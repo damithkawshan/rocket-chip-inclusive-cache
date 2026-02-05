@@ -54,6 +54,14 @@ class DirectoryRead(params: InclusiveCacheParameters) extends InclusiveCacheBund
   val source = UInt(params.inner.bundle.sourceBits.W)
 }
 
+// SSBC saturation counter update (issued by controller after final hit/miss)
+class SatCounterUpdate(params: InclusiveCacheParameters) extends InclusiveCacheBundle(params)
+{
+  val set = UInt(params.setBits.W)
+  val inc = Bool()
+  val dec = Bool()
+}
+
 class DirectoryResult(params: InclusiveCacheParameters) extends DirectoryEntry(params)
 {
   val hit = Bool()
@@ -99,6 +107,8 @@ class Directory(params: InclusiveCacheParameters) extends Module
     val read   = Flipped(Valid(new DirectoryRead(params))) // sees same-cycle write
     val result = Valid(new DirectoryResult(params))
     val ready  = Bool() // reset complete; can enable access
+    // Saturation counter update from controller (final hit/miss)
+    val satUpdate = Flipped(Valid(new SatCounterUpdate(params)))
     // Saturation counters output (one per set)
     val satCounters = Output(Vec(params.cache.sets, UInt(log2Ceil(2 * params.cache.ways).W)))
     // Second search bits output (one per set) - SSBC algorithm
@@ -279,77 +289,15 @@ class Directory(params: InclusiveCacheParameters) extends Module
   io.partnerResult.bits.victimClients := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.clients, partnerVictimEntry.clients)
   io.partnerResult.bits.victimState := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.state, partnerVictimEntry.state)
   
-  // Update saturation counters on directory access (primary lookup)
-  when (ren2 && ssbcEnabled) {
-    val accessHit = hit
-    val accessAddr = params.expandAddress(tag, set, 0.U)
-    
-    // Compute partner set (MSB complement for symmetric association)
-    val setBits = params.setBits
-    val partnerSet = Cat(~set(setBits-1), set(setBits-2, 0))
-    val partnerCounter = satCounters(partnerSet)
-    
-    // Status flags for logging
-    val atMax = currentSatCounter === satCounterMax
-    val atZero = currentSatCounter === 0.U
-    val aboveHigh = currentSatCounter >= satCounterHighThreshold
-    val partnerBelowLow = partnerCounter < satCounterLowThreshold
-    val scBit = secondSearchBits(set)
-    val partnerScBit = secondSearchBits(partnerSet)
-    
-    when (accessHit) {
-      // Decrement on hit (saturate at 0)
-      when (currentSatCounter > 0.U) {
-        satCounters(set) := currentSatCounter - 1.U
-        printf("[SSBC] HIT  set=%d cnt=%d->%d | partner=%d cnt=%d | req_src=%d line_src=%d | sc=%d psc=%d | K=%d HI=%d LO=%d | addr=0x%x\n",
-               set, currentSatCounter, currentSatCounter - 1.U,
-               partnerSet, partnerCounter,
-               reqSource, hitEntry.source,
-               scBit, partnerScBit,
-               K.U, satCounterHighThreshold, satCounterLowThreshold,
-               accessAddr)
-      } .otherwise {
-        printf("[SSBC] HIT  set=%d cnt=%d (at min) | partner=%d cnt=%d | req_src=%d line_src=%d | sc=%d psc=%d | addr=0x%x\n",
-               set, currentSatCounter,
-               partnerSet, partnerCounter,
-               reqSource, hitEntry.source,
-               scBit, partnerScBit,
-               accessAddr)
-      }
-    } .otherwise {
-      // Increment on miss (saturate at max)
-      when (currentSatCounter < satCounterMax) {
-        satCounters(set) := currentSatCounter + 1.U
-        printf("[SSBC] MISS set=%d cnt=%d->%d | partner=%d cnt=%d | req_src=%d victim_src=%d victim_valid=%d | sc=%d psc=%d | K=%d HI=%d LO=%d | addr=0x%x\n",
-               set, currentSatCounter, currentSatCounter + 1.U,
-               partnerSet, partnerCounter,
-               reqSource, victimEntry.source, victimValid,
-               scBit, partnerScBit,
-               K.U, satCounterHighThreshold, satCounterLowThreshold,
-               accessAddr)
-        // Check displacement eligibility after increment
-        when (currentSatCounter + 1.U === satCounterMax && partnerBelowLow) {
-          printf("[SSBC] *** DISPLACEMENT ELIGIBLE: set=%d at max, partner=%d cnt=%d < LO=%d ***\n",
-                 set, partnerSet, partnerCounter, satCounterLowThreshold)
-        }
-      } .otherwise {
-        printf("[SSBC] MISS set=%d cnt=%d (at max=%d) | partner=%d cnt=%d | req_src=%d victim_src=%d victim_valid=%d victim_tag=0x%x | sc=%d psc=%d | addr=0x%x\n",
-               set, currentSatCounter, satCounterMax,
-               partnerSet, partnerCounter,
-               reqSource, victimEntry.source, victimValid, victimEntry.tag,
-               scBit, partnerScBit,
-               accessAddr)
-        when (partnerBelowLow) {
-          printf("[SSBC] *** DISPLACEMENT ELIGIBLE: set=%d at max, partner=%d cnt=%d < LO=%d ***\n",
-                 set, partnerSet, partnerCounter, satCounterLowThreshold)
-        }
-      }
-      
-      // Log migration decision
-      when (shouldMigrate) {
-        printf("[SSBC] MIGRATE set=%d -> partner=%d (cnt %d >= HI, partner cnt %d < LO)\n",
-               set, partnerSet, currentSatCounter, partnerCounter)
-      }
+  // Update saturation counters from controller after final hit/miss
+  when (io.satUpdate.valid && ssbcEnabled) {
+    assert(!(io.satUpdate.bits.inc && io.satUpdate.bits.dec))
+    val updSet = io.satUpdate.bits.set
+    val cnt = satCounters(updSet)
+    when (io.satUpdate.bits.dec) {
+      when (cnt > 0.U) { satCounters(updSet) := cnt - 1.U }
+    } .elsewhen (io.satUpdate.bits.inc) {
+      when (cnt < satCounterMax) { satCounters(updSet) := cnt + 1.U }
     }
   }
 

@@ -72,8 +72,6 @@ class DirectoryResult(params: InclusiveCacheParameters) extends DirectoryEntry(p
   val partnerScBit = Bool()
   val currentSat = UInt(log2Ceil(2 * params.cache.ways).W)
   val partnerSat = UInt(log2Ceil(2 * params.cache.ways).W)
-  // Migration info: if true, evicting line should migrate to partner set
-  val shouldMigrate = Bool()
   val partnerSet = UInt(params.setBits.W)
   val partnerWay = UInt(params.wayBits.W)  // LRU victim way in partner set for migration
   // SSBC: secondary search control/summary
@@ -232,22 +230,15 @@ class Directory(params: InclusiveCacheParameters) extends Module
   val victimValid = victimEntry.state =/= INVALID  // Victim must be valid to migrate
   val resultEntry = Mux(hit, hitEntry, victimEntry)
 
-  // Enable SSBC migration/displacement logic
-  // Conditions: Miss, Victim Valid, Saturation Thresholds
-  val shouldMigrate = ssbcEnabled && !primaryHit && victimValid &&
-                      (currentSatCounter === satCounterHighThreshold) &&
-                      (partnerSatCounter < satCounterLowThreshold)
-
   io.result.valid := ren2
   io.result.bits.viewAsSupertype(chiselTypeOf(bypass.data)) := resultEntry
   io.result.bits.hit := hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
   io.result.bits.way := Mux(hit, OHToUInt(hits), Mux(setQuash && tagMatch, bypass.way, victimWay))
   io.result.bits.set := set
-  io.result.bits.scBit := secondSearchBits(set)
+  io.result.bits.scBit := true.B //  secondSearchBits(set)
   io.result.bits.partnerScBit := secondSearchBits(partnerSet)
   io.result.bits.currentSat := currentSatCounter
   io.result.bits.partnerSat := partnerSatCounter
-  io.result.bits.shouldMigrate := shouldMigrate
   io.result.bits.partnerSet := partnerSet
   io.result.bits.partnerWay := victimWay  // Use same random way selection for partner
   io.result.bits.secondaryHit := false.B

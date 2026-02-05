@@ -133,11 +133,11 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
 
   // If the pre-emption BC or C MSHR have a matching set, the normal MSHR must be blocked
   val mshr_stall_abc = abc_mshrs.map { m =>
-    (bc_mshr.io.status.valid && m.io.status.bits.set === bc_mshr.io.status.bits.set) ||
-    ( c_mshr.io.status.valid && m.io.status.bits.set ===  c_mshr.io.status.bits.set)
+    (bc_mshr.io.status.valid && m.io.status.bits.physSet === bc_mshr.io.status.bits.physSet) ||
+    ( c_mshr.io.status.valid && m.io.status.bits.physSet ===  c_mshr.io.status.bits.physSet)
   }
   val mshr_stall_bc =
-    c_mshr.io.status.valid && bc_mshr.io.status.bits.set === c_mshr.io.status.bits.set
+    c_mshr.io.status.valid && bc_mshr.io.status.bits.physSet === c_mshr.io.status.bits.physSet
   val mshr_stall_c = false.B
   val mshr_stall = mshr_stall_abc :+ mshr_stall_bc :+ mshr_stall_c
 
@@ -215,7 +215,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   sinkA.io.req.ready := directory.io.ready && request.ready && !sinkC.io.req.valid && !sinkX.io.req.valid
 
   // If no MSHR has been assigned to this set, we need to allocate one
-  val setMatches = Cat(mshrs.map { m => m.io.status.valid && m.io.status.bits.set === request.bits.set }.reverse)
+  val setMatches = Cat(mshrs.map { m => m.io.status.valid && m.io.status.bits.physSet === request.bits.set }.reverse)
   val alloc = !setMatches.orR // NOTE: no matches also means no BC or C pre-emption on this set
   // If a same-set MSHR says that requests of this type must be blocked (for bounded time), do it
   val blockB = Mux1H(setMatches, mshrs.map(_.io.status.bits.blockB)) && request.bits.prio(1)

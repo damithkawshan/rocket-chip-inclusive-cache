@@ -58,6 +58,7 @@ class MigrateRequest(params: InclusiveCacheParameters) extends InclusiveCacheBun
 class MSHRStatus(params: InclusiveCacheParameters) extends InclusiveCacheBundle(params)
 {
   val set = UInt(params.setBits.W)
+  val physSet = UInt(params.setBits.W)
   val tag = UInt(params.tagBits.W)
   val way = UInt(params.wayBits.W)
   val blockB = Bool()
@@ -128,6 +129,9 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   val ssbcNeedPartner = RegInit(false.B)
   val ssbcWaitPartner = RegInit(false.B)
   val ssbcPrimary = Reg(new DirectoryResult(params))
+  val ssbcK = params.cache.ways
+  val ssbcSatMax = (2 * ssbcK - 1).U
+  val ssbcSatLow = ssbcK.U
 
   // SSBC partner set helper
   def partnerSetOf(set: UInt): UInt = Cat(~set(params.setBits-1), set(params.setBits-2, 0))
@@ -214,7 +218,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     ssbcEnabled && !io.directory.bits.hit && io.directory.bits.scBit
 
   when (dir_valid) {
-    printf("[MSHR] DirectoryResult: set=%d tag=0x%x way=%d hit=%d state=%d clients=0x%x dirty=%d displaced=%d originSet=%d shouldMigrate=%d partnerSet=%d partnerWay=%d scBit=%d\n",
+    printf("[MSHR] DirectoryResult: set=%d tag=0x%x way=%d hit=%d state=%d clients=0x%x dirty=%d displaced=%d originSet=%d partnerSet=%d partnerWay=%d scBit=%d\n",
       io.directory.bits.set,
       io.directory.bits.tag,
       io.directory.bits.way,
@@ -224,7 +228,6 @@ class MSHR(params: InclusiveCacheParameters) extends Module
       io.directory.bits.dirty,
       io.directory.bits.displaced,
       io.directory.bits.originSet,
-      io.directory.bits.shouldMigrate,
       io.directory.bits.partnerSet,
       io.directory.bits.partnerWay,
       io.directory.bits.scBit
@@ -273,6 +276,11 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     io.satUpdate.bits.inc := !dir_final.hit
   }
 
+  // SSBC displacement decision (controller-side)
+  val shouldMigrate = ssbcEnabled && !dir_final.hit && (dir_final.state =/= INVALID) &&
+                      (dir_final.currentSat === ssbcSatMax) &&
+                      (dir_final.partnerSat < ssbcSatLow)
+
   // When a nested transaction completes, update our meta data
   when (meta_valid && meta.state =/= INVALID &&
         io.nestedwb.set === request.set && io.nestedwb.tag === meta.tag) {
@@ -285,6 +293,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   // Scheduler status
   io.status.valid := request_valid
   io.status.bits.set    := request.set
+  io.status.bits.physSet := Mux(meta_valid, meta.set, request.set)
   io.status.bits.tag    := request.tag
   io.status.bits.way    := meta.way
   io.status.bits.blockB := !meta_valid || ((!w_releaseack || !w_rprobeacklast || !w_pprobeacklast) && !w_grantfirst)
@@ -754,7 +763,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     migrate_valid    := false.B
     
     // Capture migration info from directory result
-    when (dir_final_valid && dir_final.shouldMigrate) {
+    when (dir_final_valid && shouldMigrate) {
       migrate_valid := true.B
       migrate_partnerSet := dir_final.partnerSet
       migrate_partnerWay := dir_final.partnerWay
@@ -802,7 +811,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
       // Do we need an eviction?
       when (!new_meta.hit && new_meta.state =/= INVALID) {
         // Check if migration is enabled for this eviction
-        when (dir_final_valid && dir_final.shouldMigrate) {
+        when (dir_final_valid && shouldMigrate) {
           // Migration path: lookup partner set, then migrate instead of release to memory
           s_migrate_lookup := false.B
           w_migrate_lookup := false.B

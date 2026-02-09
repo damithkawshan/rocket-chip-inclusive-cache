@@ -79,6 +79,11 @@ class BankedStore(params: InclusiveCacheParameters) extends Module
     val sourceD_rdat = new BankedStoreInnerDecoded(params)
     val sourceD_wadr = Flipped(Decoupled(new BankedStoreInnerAddress(params)))
     val sourceD_wdat = Flipped(new BankedStoreInnerPoison(params))
+    // Migration copy port (scheduler controlled): read source beat, write destination beat
+    val migrate_radr = Flipped(Decoupled(new BankedStoreInnerAddress(params)))
+    val migrate_rdat = new BankedStoreInnerDecoded(params)
+    val migrate_wadr = Flipped(Decoupled(new BankedStoreInnerAddress(params)))
+    val migrate_wdat = Flipped(new BankedStoreInnerPoison(params))
     // Bank disable input
     val bankDisable = Input(UInt(numBanks.W))
   })
@@ -207,9 +212,11 @@ class BankedStore(params: InclusiveCacheParameters) extends Module
   val sourceC_req  = req(io.sourceC_adr,  R, outerData)
   val sourceD_rreq = req(io.sourceD_radr, R, innerData)
   val sourceD_wreq = req(io.sourceD_wadr, W, io.sourceD_wdat.data)
+  val migrate_rreq = req(io.migrate_radr, R, innerData)
+  val migrate_wreq = req(io.migrate_wadr, W, io.migrate_wdat.data)
 
   // See the comments above for why this prioritization is used
-  val reqs = Seq(sinkC_req, sourceC_req, sinkD_req, sourceD_wreq, sourceD_rreq)
+  val reqs = Seq(sinkC_req, sourceC_req, sinkD_req, sourceD_wreq, sourceD_rreq, migrate_wreq, migrate_rreq)
 
   // Connect priorities; note that even if a request does not go through due to failing
   // to obtain a needed subbank, it still blocks overlapping lower priority requests.
@@ -242,6 +249,7 @@ class BankedStore(params: InclusiveCacheParameters) extends Module
 
   val regsel_sourceC = RegNext(RegNext(sourceC_req.redirectedBankEn))
   val regsel_sourceD = RegNext(RegNext(sourceD_rreq.redirectedBankEn))
+  val regsel_migrate = RegNext(RegNext(migrate_rreq.redirectedBankEn))
 
   val decodeC = regout.zipWithIndex.map {
     case (r, i) => 
@@ -256,6 +264,13 @@ class BankedStore(params: InclusiveCacheParameters) extends Module
   }.grouped(innerBytes/params.micro.writeBytes).toList.transpose.map(s => s.reduce(_|_))
 
   io.sourceD_rdat.data := Cat(decodeD.reverse)
+
+  val decodeM = regout.zipWithIndex.map {
+    case (r, i) =>
+      Mux(regsel_migrate(i), r, 0.U)
+  }.grouped(innerBytes/params.micro.writeBytes).toList.transpose.map(s => s.reduce(_|_))
+
+  io.migrate_rdat.data := Cat(decodeM.reverse)
 
   private def banks = cc_banks.map("\"" + _.pathName + "\"").mkString(",")
   def json: String = s"""{"widthBytes":${params.micro.writeBytes},"mem":[${banks}]}"""

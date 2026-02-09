@@ -235,7 +235,7 @@ class Directory(params: InclusiveCacheParameters) extends Module
   io.result.bits.hit := hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
   io.result.bits.way := Mux(hit, OHToUInt(hits), Mux(setQuash && tagMatch, bypass.way, victimWay))
   io.result.bits.set := set
-  io.result.bits.scBit := true.B //  secondSearchBits(set)
+  io.result.bits.scBit := secondSearchBits(set)
   io.result.bits.partnerScBit := secondSearchBits(partnerSet)
   io.result.bits.currentSat := currentSatCounter
   io.result.bits.partnerSat := partnerSatCounter

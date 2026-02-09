@@ -47,6 +47,9 @@ class MigrateRequest(params: InclusiveCacheParameters) extends InclusiveCacheBun
   val srcWay = UInt(params.wayBits.W)
   val srcTag = UInt(params.tagBits.W)
   val srcDirty = Bool()
+  val srcState = UInt(params.stateBits.W)
+  val srcClients = UInt(params.clientBits.W)
+  val srcSource = UInt(params.inner.bundle.sourceBits.W)
   val dstSet = UInt(params.setBits.W)
   val dstWay = UInt(params.wayBits.W)
   // Info about the victim in destination set (needs to be evicted)
@@ -98,7 +101,7 @@ case object S_TIP_D    extends CacheState
 case object S_TRUNK_C  extends CacheState
 case object S_TRUNK_CD extends CacheState
 
-class MSHR(params: InclusiveCacheParameters) extends Module
+class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
 {
   val io = IO(new Bundle {
     val allocate  = Flipped(Valid(new AllocateRequest(params))) // refills MSHR for next cycle
@@ -117,6 +120,8 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     val partnerReadGrant = Input(Bool())
     // SSBC saturation counter update (final hit/miss)
     val satUpdate = Valid(new SatCounterUpdate(params))
+    // Migration copy+directory update completion from scheduler
+    val migrateDone = Input(Bool())
   })
 
   val request_valid = RegInit(false.B)
@@ -198,6 +203,9 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   val migrate_partnerVictimTag = Reg(UInt(params.tagBits.W))
   val migrate_partnerVictimDirty = Reg(Bool())
   val migrate_partnerVictimValid = Reg(Bool())
+  val migrate_partnerVictimClients = Reg(UInt(params.clientBits.W))
+  val migrate_partnerVictimState = Reg(UInt(params.stateBits.W))
+  val migrate_evict_partner = RegInit(false.B)
 
   // [1]: We cannot issue outer Acquire while holding blockB (=> outA can stall)
   // However, inB and outC are higher priority than outB, so s_release and s_pprobe
@@ -218,7 +226,8 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     ssbcEnabled && !io.directory.bits.hit && io.directory.bits.scBit
 
   when (dir_valid) {
-    printf("[MSHR] DirectoryResult: set=%d tag=0x%x way=%d hit=%d state=%d clients=0x%x dirty=%d displaced=%d originSet=%d partnerSet=%d partnerWay=%d scBit=%d\n",
+    printf("[MSHR %d] DirectoryResult: set=%d tag=0x%x way=%d hit=%d state=%d clients=0x%x dirty=%d displaced=%d originSet=%d partnerSet=%d partnerWay=%d scBit=%d\n",
+      id.U,
       io.directory.bits.set,
       io.directory.bits.tag,
       io.directory.bits.way,
@@ -237,8 +246,8 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   when (primary_need_partner) {
     ssbcPrimary := io.directory.bits
     ssbcNeedPartner := true.B
-    printf("[SSBC MSHR] PRIMARY_MISS set=%d tag=0x%x sc=1 -> partner lookup\n",
-           io.directory.bits.set, io.directory.bits.tag)
+    printf("[SSBC MSHR %d] PRIMARY_MISS set=%d tag=0x%x sc=1 -> partner lookup\n",
+           id.U, io.directory.bits.set, io.directory.bits.tag)
   }
 
   when (ssbcNeedPartner && io.partnerReadGrant) {
@@ -260,11 +269,11 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   when (ssbcWaitPartner && dir_valid) {
     ssbcWaitPartner := false.B
     when (secondary_hit) {
-      printf("[SSBC MSHR] SECONDARY_HIT origSet=%d partnerSet=%d way=%d tag=0x%x\n",
-             ssbcPrimary.set, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag)
+      printf("[SSBC MSHR %d] SECONDARY_HIT origSet=%d partnerSet=%d way=%d tag=0x%x\n",
+             id.U, ssbcPrimary.set, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag)
     } .otherwise {
-      printf("[SSBC MSHR] SECONDARY_MISS origSet=%d partnerSet=%d tag=0x%x\n",
-             ssbcPrimary.set, io.directory.bits.set, io.directory.bits.tag)
+      printf("[SSBC MSHR %d] SECONDARY_MISS origSet=%d partnerSet=%d tag=0x%x\n",
+             id.U, ssbcPrimary.set, io.directory.bits.set, io.directory.bits.tag)
     }
   }
 
@@ -280,6 +289,10 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   val shouldMigrate = ssbcEnabled && !dir_final.hit && (dir_final.state =/= INVALID) &&
                       (dir_final.currentSat === ssbcSatMax) &&
                       (dir_final.partnerSat < ssbcSatLow)
+  // Migration datapath (actual line move + dual-directory update) is not complete yet.
+  // Keep decision visibility, but execute normal eviction until datapath support is added.
+  val migrationPathReady = true.B
+  val doMigrate = shouldMigrate && migrationPathReady
 
   // When a nested transaction completes, update our meta data
   when (meta_valid && meta.state =/= INVALID &&
@@ -293,9 +306,9 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   // Scheduler status
   io.status.valid := request_valid
   io.status.bits.set    := request.set
-  io.status.bits.physSet := Mux(meta_valid, meta.set, request.set)
+  io.status.bits.physSet := Mux(migrate_evict_partner, migrate_partnerSet, Mux(meta_valid, meta.set, request.set))
   io.status.bits.tag    := request.tag
-  io.status.bits.way    := meta.way
+  io.status.bits.way    := Mux(migrate_evict_partner, migrate_partnerWay, meta.way)
   io.status.bits.blockB := !meta_valid || ((!w_releaseack || !w_rprobeacklast || !w_pprobeacklast) && !w_grantfirst)
   io.status.bits.nestB  := meta_valid && w_releaseack && w_rprobeacklast && w_pprobeacklast && !w_grantfirst
   // The above rules ensure we will block and not nest an outer probe while still doing our
@@ -312,21 +325,37 @@ class MSHR(params: InclusiveCacheParameters) extends Module
 
   // Scheduler requests
   val no_wait = w_rprobeacklast && w_releaseack && w_grantlast && w_pprobeacklast && w_grantack && w_migrate_done
-  io.schedule.bits.a.valid := !s_acquire && s_release && s_pprobe && s_migrate
+  val partner_evict_done = migrate_evict_partner && w_rprobeacklast && w_releaseack
+  when (partner_evict_done) {
+    migrate_evict_partner := false.B
+    // Partner victim eviction is complete; return to normal (post-evict) flow.
+    s_rprobe := true.B
+    s_release := true.B
+    w_rprobeackfirst := true.B
+    w_rprobeacklast := true.B
+    w_releaseack := true.B
+    printf("[SSBC TMP %d] PARTNER_EVICT_DONE set=%d way=%d tag=0x%x\n",
+           id.U, migrate_partnerSet, migrate_partnerWay, migrate_partnerVictimTag)
+  }
+  // Acquire is only legal once migration (if any) has actually completed.
+  io.schedule.bits.a.valid := !s_acquire && s_release && s_pprobe && s_migrate && w_migrate_done
   io.schedule.bits.b.valid := !s_rprobe || !s_pprobe
-  io.schedule.bits.c.valid := (!s_release && w_rprobeackfirst && !request.control.invalidate && !migrate_valid) || (!s_probeack && w_pprobeackfirst)
+  io.schedule.bits.c.valid := (!s_release && w_rprobeackfirst && !request.control.invalidate && (!migrate_valid || migrate_evict_partner)) || (!s_probeack && w_pprobeackfirst)
   io.schedule.bits.d.valid := !s_execute && w_pprobeack && w_grant
   io.schedule.bits.e.valid := !s_grantack && w_grantfirst
   io.schedule.bits.x.valid := (!s_flush && w_releaseack && !request.control.invalidate) || (!s_flush && w_rprobeackfirst && request.control.invalidate)
-  io.schedule.bits.dir.valid := (!s_release && w_rprobeackfirst && !migrate_valid) || (!s_writeback && no_wait)
+  io.schedule.bits.dir.valid := (!s_release && w_rprobeackfirst && (!migrate_valid || migrate_evict_partner)) || (!s_writeback && no_wait)
   io.schedule.bits.reload := no_wait
   
   // Migration schedule - when we have migration info and normal release is done
-  io.schedule.bits.migrate.valid := !s_migrate && w_migrate_lookup && migrate_valid
+  io.schedule.bits.migrate.valid := !s_migrate && w_migrate_lookup && migrate_valid && !migrate_evict_partner
   io.schedule.bits.migrate.bits.srcSet := request.set
   io.schedule.bits.migrate.bits.srcWay := meta.way
   io.schedule.bits.migrate.bits.srcTag := meta.tag
   io.schedule.bits.migrate.bits.srcDirty := meta.dirty
+  io.schedule.bits.migrate.bits.srcState := meta.state
+  io.schedule.bits.migrate.bits.srcClients := meta.clients
+  io.schedule.bits.migrate.bits.srcSource := meta.source
   io.schedule.bits.migrate.bits.dstSet := migrate_partnerSet
   io.schedule.bits.migrate.bits.dstWay := migrate_partnerWay
   io.schedule.bits.migrate.bits.dstVictimTag := migrate_partnerVictimTag
@@ -344,8 +373,10 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   // Schedule completions
   when (io.schedule.ready) {
                                                             s_rprobe     := true.B
-    when (w_rprobeackfirst && !migrate_valid)             { s_release    := true.B }
-    when (w_rprobeackfirst && migrate_valid)              { s_migrate_lookup := true.B }  // Start migration lookup instead of release
+    // For normal eviction and partner-victim eviction, release is done once scheduled.
+    when (w_rprobeackfirst && (!migrate_valid || migrate_evict_partner)) { s_release := true.B }
+    // For migration (without partner-victim release), advance to partner lookup stage.
+    when (w_rprobeackfirst && migrate_valid && !migrate_evict_partner)   { s_migrate_lookup := true.B }
                                                             s_pprobe     := true.B
     when (s_release && s_pprobe && s_migrate)             { s_acquire    := true.B }
     when (w_releaseack && !request.control.invalidate)    { s_flush      := true.B }
@@ -354,9 +385,9 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     when (w_grantfirst)                                   { s_grantack   := true.B }
     when (w_pprobeack && w_grant)                         { s_execute    := true.B }
     when (no_wait)                                        { s_writeback  := true.B }
-    when (w_migrate_lookup && migrate_valid)              { s_migrate    := true.B }
-    // Mark migration as done when it's scheduled
-    when (io.schedule.bits.migrate.valid)                 { w_migrate_done := true.B }
+    when (io.schedule.bits.migrate.valid)                 { s_migrate    := true.B }
+    // Keep waiting until scheduler reports migration copy+directory updates completed.
+    when (io.schedule.bits.migrate.valid)                 { w_migrate_done := false.B }
     // Await the next operation
     when (no_wait) {
       request_valid := false.B
@@ -364,19 +395,50 @@ class MSHR(params: InclusiveCacheParameters) extends Module
       migrate_valid := false.B
       ssbcNeedPartner := false.B
       ssbcWaitPartner := false.B
+      migrate_evict_partner := false.B
     }
+  }
+
+  when (io.migrateDone) {
+    w_migrate_done := true.B
+    printf("[SSBC MSHR %d] MIGRATE_DONE srcSet=%d srcWay=%d dstSet=%d dstWay=%d\n",
+           id.U, request.set, meta.way, migrate_partnerSet, migrate_partnerWay)
   }
   
   // Handle partner lookup result
   when (io.partnerResult.valid && !w_migrate_lookup) {
     w_migrate_lookup := true.B
-    migrate_partnerWay := io.partnerResult.bits.way
-    migrate_partnerVictimTag := io.partnerResult.bits.victimTag
+    migrate_partnerWay := io.partnerResult.bits.way //this is the way that we will migrate to, which is the victim way in the partner set
+    migrate_partnerVictimTag := io.partnerResult.bits.victimTag 
     migrate_partnerVictimDirty := io.partnerResult.bits.victimDirty
     migrate_partnerVictimValid := io.partnerResult.bits.victimValid
-    printf("[SSBC MSHR] PARTNER_LOOKUP partnerSet=%d way=%d tag=0x%x dirty=%d valid=%d\n",
-           migrate_partnerSet, io.partnerResult.bits.way, io.partnerResult.bits.victimTag,
+    migrate_partnerVictimClients := io.partnerResult.bits.victimClients
+    migrate_partnerVictimState := io.partnerResult.bits.victimState
+    printf("[SSBC MSHR %d] PARTNER_LOOKUP partnerSet=%d way=%d tag=0x%x dirty=%d valid=%d\n",
+           id.U, migrate_partnerSet, io.partnerResult.bits.way, io.partnerResult.bits.victimTag,
            io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimValid)
+
+    // Step 1: handle partner victim eviction before migration
+    when (io.partnerResult.bits.victimValid) {
+      migrate_evict_partner := true.B
+      printf("[SSBC TMP %d] PARTNER_EVICT_START set=%d way=%d tag=0x%x dirty=%d clients=0x%x state=%d\n",
+             id.U, migrate_partnerSet, migrate_partnerWay, io.partnerResult.bits.victimTag,
+             io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimClients,
+             io.partnerResult.bits.victimState)
+      // Schedule release if dirty; otherwise skip release ack wait
+      s_release := false.B
+      w_releaseack := !io.partnerResult.bits.victimDirty
+      // Partner-victim probe requirements are independent from source-set probe state.
+      when ((!params.firstLevel).B && (io.partnerResult.bits.victimClients =/= 0.U)) {
+        s_rprobe := false.B
+        w_rprobeackfirst := false.B
+        w_rprobeacklast := false.B
+      } .otherwise {
+        s_rprobe := true.B
+        w_rprobeackfirst := true.B
+        w_rprobeacklast := true.B
+      }
+    }
   }
 
   // Resulting meta-data
@@ -387,6 +449,14 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   val req_acquire = request.opcode === AcquireBlock || request.opcode === AcquirePerm
   val meta_no_clients = !meta.clients.orR
   val req_promoteT = req_acquire && Mux(meta.hit, meta_no_clients && meta.state === TIP, gotT)
+
+  // Eviction metadata (normal vs partner victim)
+  val evictSet = Mux(migrate_evict_partner, migrate_partnerSet, request.set)
+  val evictTag = Mux(migrate_evict_partner, migrate_partnerVictimTag, meta.tag)
+  val evictWay = Mux(migrate_evict_partner, migrate_partnerWay, meta.way)
+  val evictDirty = Mux(migrate_evict_partner, migrate_partnerVictimDirty, meta.dirty)
+  val evictState = Mux(migrate_evict_partner, migrate_partnerVictimState, meta.state)
+  val evictClients = Mux(migrate_evict_partner, migrate_partnerVictimClients, meta.clients)
 
   // when (request_valid) {
   //   printf("MSHR: Valid request - source=0x%x, clientBit=0x%x, clientId=%d, opcode=0x%x, addr=0x%x\n",
@@ -464,6 +534,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
 
   // The client asking us to act is proof they don't have permissions.
   val excluded_client = Mux(meta.hit && request.prio(0) && skipProbeN(request.opcode, params.cache.hintsSkipProbe), req_clientBit, 0.U)
+  val evict_excluded = Mux(migrate_evict_partner, 0.U, excluded_client)
   io.schedule.bits.a.bits.tag     := request.tag
   io.schedule.bits.a.bits.set     := request.set
   io.schedule.bits.a.bits.param   := Mux(req_needT, Mux(meta.hit, BtoT, NtoT), NtoB)
@@ -471,16 +542,16 @@ class MSHR(params: InclusiveCacheParameters) extends Module
                                      !(request.opcode === PutFullData || request.opcode === AcquirePerm)
   io.schedule.bits.a.bits.source  := 0.U
   io.schedule.bits.b.bits.param   := Mux(!s_rprobe, toN, Mux(request.prio(1), request.param, Mux(req_needT, toN, toB)))
-  io.schedule.bits.b.bits.tag     := Mux(!s_rprobe, meta.tag, request.tag)
-  io.schedule.bits.b.bits.set     := request.set
-  io.schedule.bits.b.bits.clients := meta.clients & ~excluded_client
-  io.schedule.bits.c.bits.opcode  := Mux(meta.dirty, ReleaseData, Release)
-  io.schedule.bits.c.bits.param   := Mux(meta.state === BRANCH, BtoN, TtoN)
+  io.schedule.bits.b.bits.tag     := Mux(!s_rprobe, evictTag, request.tag)
+  io.schedule.bits.b.bits.set     := evictSet
+  io.schedule.bits.b.bits.clients := evictClients & ~evict_excluded
+  io.schedule.bits.c.bits.opcode  := Mux(evictDirty, ReleaseData, Release)
+  io.schedule.bits.c.bits.param   := Mux(evictState === BRANCH, BtoN, TtoN)
   io.schedule.bits.c.bits.source  := 0.U
-  io.schedule.bits.c.bits.tag     := meta.tag
-  io.schedule.bits.c.bits.set     := request.set
-  io.schedule.bits.c.bits.way     := meta.way
-  io.schedule.bits.c.bits.dirty   := meta.dirty
+  io.schedule.bits.c.bits.tag     := evictTag
+  io.schedule.bits.c.bits.set     := evictSet
+  io.schedule.bits.c.bits.way     := evictWay
+  io.schedule.bits.c.bits.dirty   := evictDirty
   io.schedule.bits.d.bits.viewAsSupertype(chiselTypeOf(request)) := request
   io.schedule.bits.d.bits.set     := meta.set
   io.schedule.bits.d.bits.param   := Mux(!req_acquire, request.param,
@@ -493,8 +564,8 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   io.schedule.bits.d.bits.bad     := bad_grant
   io.schedule.bits.e.bits.sink    := sink
   io.schedule.bits.x.bits.fail    := false.B
-  io.schedule.bits.dir.bits.set   := meta.set
-  io.schedule.bits.dir.bits.way   := meta.way
+  io.schedule.bits.dir.bits.set   := Mux(migrate_evict_partner, migrate_partnerSet, meta.set)
+  io.schedule.bits.dir.bits.way   := evictWay
   io.schedule.bits.dir.bits.data  := Mux(!s_release, invalid, WireInit(new DirectoryEntry(params), init = final_meta_writeback))
 
   // Coverage of state transitions
@@ -644,9 +715,15 @@ class MSHR(params: InclusiveCacheParameters) extends Module
 
   // Handle response messages
   val probe_bit = params.clientBit(io.sinkc.bits.source)
-  val last_probe = (probes_done | probe_bit) === (meta.clients & ~excluded_client)
+  val probe_target_clients = evictClients & ~evict_excluded
+  val last_probe = (probes_done | probe_bit) === probe_target_clients
   val probe_toN = isToN(io.sinkc.bits.param)
   if (!params.firstLevel) when (io.sinkc.valid) {
+    when (migrate_evict_partner) {
+      printf("[SSBC TMP] PARTNER_PROBE_ACK src=%d set=%d tag=0x%x done=0x%x target=0x%x last=%d\n",
+             io.sinkc.bits.source, io.sinkc.bits.set, io.sinkc.bits.tag,
+             probes_done | probe_bit, probe_target_clients, last_probe)
+    }
     params.ccover( probe_toN && io.schedule.bits.b.bits.param === toB, "MSHR_PROBE_FULL", "Client downgraded to N when asked only to do B")
     params.ccover(!probe_toN && io.schedule.bits.b.bits.param === toB, "MSHR_PROBE_HALF", "Client downgraded to B when asked only to do B")
     // Caution: the probe matches us only in set.
@@ -655,10 +732,11 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     probes_done := probes_done | probe_bit
     probes_toN := probes_toN | Mux(probe_toN, probe_bit, 0.U)
     probes_noT := probes_noT || io.sinkc.bits.param =/= TtoT
+    val probe_last_beat = io.sinkc.bits.last || !io.sinkc.bits.data
     w_rprobeackfirst := w_rprobeackfirst || last_probe
-    w_rprobeacklast := w_rprobeacklast || (last_probe && io.sinkc.bits.last)
+    w_rprobeacklast := w_rprobeacklast || (last_probe && probe_last_beat)
     w_pprobeackfirst := w_pprobeackfirst || last_probe
-    w_pprobeacklast := w_pprobeacklast || (last_probe && io.sinkc.bits.last)
+    w_pprobeacklast := w_pprobeacklast || (last_probe && probe_last_beat)
     // Allow wormhole routing from sinkC if the first request beat has offset 0
     val set_pprobeack = last_probe && (io.sinkc.bits.last || request.offset === 0.U)
     w_pprobeack := w_pprobeack || set_pprobeack
@@ -762,13 +840,18 @@ class MSHR(params: InclusiveCacheParameters) extends Module
     w_migrate_done   := true.B
     migrate_valid    := false.B
     
+    when (dir_final_valid && shouldMigrate && !migrationPathReady) {
+      printf("[SSBC MSHR %d] MIGRATE_BYPASS srcSet=%d srcTag=0x%x (decision=1, path=normal-evict)\n",
+             id.U, dir_final.set, dir_final.tag)
+    }
+
     // Capture migration info from directory result
-    when (dir_final_valid && shouldMigrate) {
+    when (dir_final_valid && doMigrate) {
       migrate_valid := true.B
       migrate_partnerSet := dir_final.partnerSet
       migrate_partnerWay := dir_final.partnerWay
-      printf("[SSBC MSHR] MIGRATE_TRIGGER srcSet=%d srcTag=0x%x -> partnerSet=%d partnerWay=%d\n",
-             dir_final.set, dir_final.tag, 
+      printf("[SSBC MSHR %d] MIGRATE_TRIGGER srcSet=%d srcTag=0x%x -> partnerSet=%d partnerWay=%d\n",
+             id.U, dir_final.set, dir_final.tag, 
              dir_final.partnerSet, dir_final.partnerWay)
     }
 
@@ -811,7 +894,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
       // Do we need an eviction?
       when (!new_meta.hit && new_meta.state =/= INVALID) {
         // Check if migration is enabled for this eviction
-        when (dir_final_valid && shouldMigrate) {
+        when (dir_final_valid && doMigrate) {
           // Migration path: lookup partner set, then migrate instead of release to memory
           s_migrate_lookup := false.B
           w_migrate_lookup := false.B

@@ -36,6 +36,8 @@ class SinkD(params: InclusiveCacheParameters) extends Module
   val io = IO(new Bundle {
     val resp = Valid(new SinkDResponse(params)) // Grant or ReleaseAck
     val d = Flipped(Decoupled(new TLBundleD(params.outer.bundle)))
+    // Bus-level interlock from scheduler (computed on monitor-facing signals)
+    val blockReady = Input(Bool())
     // Lookup the set+way from MSHRs
     val source = UInt(params.outer.bundle.sourceBits.W)
     val way    = Flipped(UInt(params.wayBits.W))
@@ -60,10 +62,14 @@ class SinkD(params: InclusiveCacheParameters) extends Module
 
   // Also send Grant(NoData) to BS to ensure correct data ordering
   io.resp.valid := (first || last) && d.fire
-  d.ready := io.bs_adr.ready && (!first || io.grant_safe)
+  d.ready := io.bs_adr.ready && (!first || io.grant_safe) && !io.blockReady
   io.bs_adr.valid := !first || (d.valid && io.grant_safe)
   params.ccover(d.valid && first && !io.grant_safe, "SINKD_HAZARD", "Prevented Grant data hazard with backpressure")
   params.ccover(io.bs_adr.valid && !io.bs_adr.ready, "SINKD_SRAM_STALL", "Data SRAM busy")
+  when (d.valid && io.blockReady) {
+    printf("[SSBC TMP D_BLOCK] source=%d opcode=%d first=%d blockReady=1\n",
+      d.bits.source, d.bits.opcode, first)
+  }
 
   io.resp.bits.last   := last
   io.resp.bits.opcode := d.bits.opcode

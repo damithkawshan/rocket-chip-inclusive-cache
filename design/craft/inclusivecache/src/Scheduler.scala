@@ -80,21 +80,43 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   sinkE.io.e <> io.in.e
   sinkD.io.d <> io.out.d
   sinkX.io.x <> io.req
+  val (aFirst, _, _, _) = params.outer.count(io.out.a)
+  val (dFirst, _, _, _) = params.outer.count(io.out.d)
+  val dIsReleaseAck = io.out.d.bits.opcode === TLMessages.ReleaseAck
+  val blockDReadyForSourceHazard = io.out.d.valid && dFirst &&
+    io.out.a.valid && aFirst &&
+    (io.out.a.bits.source === io.out.d.bits.source) &&
+    !dIsReleaseAck &&
+    !io.out.a.ready
+  sinkD.io.blockReady := blockDReadyForSourceHazard
 
   io.out.b.ready := true.B // disconnected
 
   val directory = Module(new Directory(params))
   val bankedStore = Module(new BankedStore(params))
   val requests = Module(new ListBuffer(ListBufferParameters(new QueuedRequest(params), 3*params.mshrs, params.secondary, false)))
-  val mshrs = Seq.fill(params.mshrs) { Module(new MSHR(params)) }
+  val mshrs = Seq.tabulate(params.mshrs) { i => Module(new MSHR(params, i)) }
   val abc_mshrs = mshrs.init.init
   val bc_mshr = mshrs.init.last
   val c_mshr = mshrs.last
   val nestedwb = Wire(new NestedWriteback(params))
 
+  // Migration copy engine state (scheduler-controlled)
+  val migrateIdle :: migrateReadReq :: migrateReadWait :: migrateWriteReq :: migrateDirDst :: migrateDirSrc :: migrateDone :: Nil = Enum(7)
+  val migrateState = RegInit(migrateIdle)
+  val migrationReq = Reg(new MigrateRequest(params))
+  val migrationOwnerOH = RegInit(0.U(params.mshrs.W))
+  val migrationBeat = RegInit(0.U(params.innerBeatBits.W))
+  val migrationReadDelay = RegInit(0.U(2.W))
+  val migrationReadData = Reg(UInt(params.inner.bundle.dataBits.W))
+  val migrationBusy = migrateState =/= migrateIdle
+  val migrateBlockBeats = params.cache.blockBytes / params.inner.manager.beatBytes
+  val migrateLastBeat = (migrateBlockBeats - 1).U(params.innerBeatBits.W)
+  val migrationDonePulse = WireDefault(false.B)
+
   // Deliver messages from Sinks to MSHRs
   mshrs.zipWithIndex.foreach { case (m, i) =>
-    m.io.sinkc.valid := sinkC.io.resp.valid && sinkC.io.resp.bits.set === m.io.status.bits.set
+    m.io.sinkc.valid := sinkC.io.resp.valid && sinkC.io.resp.bits.set === m.io.status.bits.physSet
     m.io.sinkd.valid := sinkD.io.resp.valid && sinkD.io.resp.bits.source === i.U
     m.io.sinke.valid := sinkE.io.resp.valid && sinkE.io.resp.bits.sink   === i.U
     m.io.sinkc.bits := sinkC.io.resp.bits
@@ -106,12 +128,14 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
     m.io.partnerResult.bits := directory.io.partnerResult.bits
     // Default: no partner read grant
     m.io.partnerReadGrant := false.B
+    // Default: migration not completed this cycle
+    m.io.migrateDone := false.B
   }
   
   // Partner lookup arbitration - only one MSHR can use partner lookup at a time
   val partnerLookupReqs = mshrs.map(_.io.partnerLookup.valid)
   val partnerLookupGrant = PriorityEncoderOH(partnerLookupReqs)
-  directory.io.partnerLookup.valid := partnerLookupReqs.reduce(_ || _)
+  directory.io.partnerLookup.valid := !migrationBusy && partnerLookupReqs.reduce(_ || _)
   directory.io.partnerLookup.bits := Mux1H(partnerLookupGrant, mshrs.map(_.io.partnerLookup.bits))
   
   // Route partner result back to the requesting MSHR
@@ -125,7 +149,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   val partnerReadReqs = mshrs.map(_.io.partnerRead.valid)
   val partnerReadOH = PriorityEncoderOH(Cat(partnerReadReqs.reverse))
   val partnerReadAny = partnerReadReqs.reduce(_ || _)
-  val partnerReadFire = partnerReadAny && directory.io.ready
+  val partnerReadFire = partnerReadAny && directory.io.ready && !migrationBusy
   val partnerReadBits = Mux1H(partnerReadOH, mshrs.map(_.io.partnerRead.bits))
   mshrs.zipWithIndex.foreach { case (m, i) =>
     when (partnerReadFire && partnerReadOH(i)) { m.io.partnerReadGrant := true.B }
@@ -141,6 +165,12 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   val mshr_stall_c = false.B
   val mshr_stall = mshr_stall_abc :+ mshr_stall_bc :+ mshr_stall_c
 
+  mshrs.zipWithIndex.foreach { case (m, i) =>
+    when (migrationDonePulse && migrationOwnerOH(i)) {
+      m.io.migrateDone := true.B
+    }
+  }
+
 
   val stall_abc = (mshr_stall_abc zip abc_mshrs) map { case (s, m) => s && m.io.status.valid }
   if (!params.lastLevel || !params.firstLevel)
@@ -150,7 +180,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
 
   // Consider scheduling an MSHR only if all the resources it requires are available
   val mshr_request = Cat((mshrs zip mshr_stall).map { case (m, s) =>
-    m.io.schedule.valid && !s &&
+    m.io.schedule.valid && !s && !migrationBusy &&
       (sourceA.io.req.ready || !m.io.schedule.bits.a.valid) &&
       (sourceB.io.req.ready || !m.io.schedule.bits.b.valid) &&
       (sourceC.io.req.ready || !m.io.schedule.bits.c.valid) &&
@@ -178,12 +208,12 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   schedule.c.bits.source := Mux(schedule.c.bits.opcode(1), mshr_select, 0.U) // only set for Release[Data] not ProbeAck[Data]
   schedule.d.bits.sink   := mshr_select
 
-  sourceA.io.req.valid := schedule.a.valid
-  sourceB.io.req.valid := schedule.b.valid
-  sourceC.io.req.valid := schedule.c.valid
-  sourceD.io.req.valid := schedule.d.valid
-  sourceE.io.req.valid := schedule.e.valid
-  sourceX.io.req.valid := schedule.x.valid
+  sourceA.io.req.valid := !migrationBusy && schedule.a.valid
+  sourceB.io.req.valid := !migrationBusy && schedule.b.valid
+  sourceC.io.req.valid := !migrationBusy && schedule.c.valid
+  sourceD.io.req.valid := !migrationBusy && schedule.d.valid
+  sourceE.io.req.valid := !migrationBusy && schedule.e.valid
+  sourceX.io.req.valid := !migrationBusy && schedule.x.valid
 
   sourceA.io.req.bits.viewAsSupertype(chiselTypeOf(schedule.a.bits)) := schedule.a.bits
   sourceB.io.req.bits.viewAsSupertype(chiselTypeOf(schedule.b.bits)) := schedule.b.bits
@@ -192,8 +222,11 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   sourceE.io.req.bits.viewAsSupertype(chiselTypeOf(schedule.e.bits)) := schedule.e.bits
   sourceX.io.req.bits.viewAsSupertype(chiselTypeOf(schedule.x.bits)) := schedule.x.bits
 
-  directory.io.write.valid := schedule.dir.valid
-  directory.io.write.bits.viewAsSupertype(chiselTypeOf(schedule.dir.bits)) := schedule.dir.bits
+  val migrationDirWrite = Wire(Valid(new DirectoryWrite(params)))
+  migrationDirWrite.valid := false.B
+  migrationDirWrite.bits := 0.U.asTypeOf(new DirectoryWrite(params))
+  directory.io.write.valid := Mux(migrationBusy, migrationDirWrite.valid, schedule.dir.valid)
+  directory.io.write.bits.viewAsSupertype(chiselTypeOf(schedule.dir.bits)) := Mux(migrationBusy, migrationDirWrite.bits, schedule.dir.bits)
 
   // Forward meta-data changes from nested transaction completion
   val select_c  = mshr_selectOH(params.mshrs-1)
@@ -300,15 +333,15 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
 
   // Fanout the request to the appropriate handler (if any)
   val bypassQueue = schedule.reload && bypassMatches
-  val request_alloc_cases = !partnerReadFire && (
+  val request_alloc_cases = !migrationBusy && !partnerReadFire && (
      (alloc && !mshr_uses_directory_assuming_no_bypass && mshr_free) ||
      (nestB && !mshr_uses_directory_assuming_no_bypass && !bc_mshr.io.status.valid && !c_mshr.io.status.valid) ||
      (nestC && !mshr_uses_directory_assuming_no_bypass && !c_mshr.io.status.valid))
-  request.ready := !partnerReadFire && (request_alloc_cases || (queue && (bypassQueue || requests.io.push.ready)))
-  val alloc_uses_directory = !partnerReadFire && request.valid && request_alloc_cases
+  request.ready := !migrationBusy && !partnerReadFire && (request_alloc_cases || (queue && (bypassQueue || requests.io.push.ready)))
+  val alloc_uses_directory = !migrationBusy && !partnerReadFire && request.valid && request_alloc_cases
 
   // When a request goes through, it will need to hit the Directory
-  directory.io.read.valid := partnerReadFire || mshr_uses_directory || alloc_uses_directory
+  directory.io.read.valid := !migrationBusy && (partnerReadFire || mshr_uses_directory || alloc_uses_directory)
   directory.io.read.bits.set :=
     Mux(partnerReadFire, partnerReadBits.set,
       Mux(mshr_uses_directory_for_lb, scheduleSet, request.bits.set))
@@ -320,7 +353,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
       Mux(mshr_uses_directory_for_lb, requests.io.data.source, request.bits.source))
 
   // Enqueue the request if not bypassed directly into an MSHR
-  requests.io.push.valid := request.valid && queue && !bypassQueue && !partnerReadFire
+  requests.io.push.valid := request.valid && queue && !bypassQueue && !partnerReadFire && !migrationBusy
   requests.io.push.bits.data  := request.bits
   requests.io.push.bits.index := Mux1H(
     request.bits.prio, Seq(
@@ -374,9 +407,9 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
 
   // MSHR response meta-data fetch
   sinkC.io.way :=
-    Mux(bc_mshr.io.status.valid && bc_mshr.io.status.bits.set === sinkC.io.set,
+    Mux(bc_mshr.io.status.valid && bc_mshr.io.status.bits.physSet === sinkC.io.set,
       bc_mshr.io.status.bits.way,
-      Mux1H(abc_mshrs.map(m => m.io.status.valid && m.io.status.bits.set === sinkC.io.set),
+      Mux1H(abc_mshrs.map(m => m.io.status.valid && m.io.status.bits.physSet === sinkC.io.set),
             abc_mshrs.map(_.io.status.bits.way)))
   sinkD.io.way := VecInit(mshrs.map(_.io.status.bits.way))(sinkD.io.source)
   sinkD.io.set := VecInit(mshrs.map(_.io.status.bits.set))(sinkD.io.source)
@@ -400,6 +433,21 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   sourceC.io.bs_dat := bankedStore.io.sourceC_dat
   sourceD.io.bs_rdat := bankedStore.io.sourceD_rdat
 
+  // Default migration copy ports (activated by migration FSM below)
+  bankedStore.io.migrate_radr.valid := false.B
+  bankedStore.io.migrate_radr.bits.noop := false.B
+  bankedStore.io.migrate_radr.bits.way := 0.U
+  bankedStore.io.migrate_radr.bits.set := 0.U
+  bankedStore.io.migrate_radr.bits.beat := 0.U
+  bankedStore.io.migrate_radr.bits.mask := ~0.U(params.innerMaskBits.W)
+  bankedStore.io.migrate_wadr.valid := false.B
+  bankedStore.io.migrate_wadr.bits.noop := false.B
+  bankedStore.io.migrate_wadr.bits.way := 0.U
+  bankedStore.io.migrate_wadr.bits.set := 0.U
+  bankedStore.io.migrate_wadr.bits.beat := 0.U
+  bankedStore.io.migrate_wadr.bits.mask := ~0.U(params.innerMaskBits.W)
+  bankedStore.io.migrate_wdat.data := migrationReadData
+
   // SourceD data hazard interlock
   sourceD.io.evict_req := sourceC.io.evict_req
   sourceD.io.grant_req := sinkD  .io.grant_req
@@ -407,15 +455,94 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   sinkD  .io.grant_safe := sourceD.io.grant_safe
 
   // Migration handling
-  // When a migration is scheduled, we need to:
-  // 1. If partner victim is dirty, evict it to memory first (via SourceC)
-  // 2. Copy data from source set/way to partner set/way (via BankedStore)
-  // 3. Update directory entries for both sets
-  when (schedule.migrate.valid && mshr_selectOH.orR) {
-    printf("L2 Migration Execute: srcSet=%d srcWay=%d srcTag=0x%x -> dstSet=%d dstWay=%d (victimTag=0x%x victimDirty=%d victimValid=%d)\n",
+  val migrationStart = !migrationBusy && mshr_selectOH.orR && schedule.migrate.valid
+  when (migrationStart) {
+    migrationReq := schedule.migrate.bits
+    migrationOwnerOH := mshr_selectOH
+    migrationBeat := 0.U
+    migrationReadDelay := 0.U
+    migrateState := migrateReadReq
+    printf("[SSBC MIGRATE] START srcSet=%d srcWay=%d srcTag=0x%x srcState=%d srcDirty=%d -> dstSet=%d dstWay=%d\n",
            schedule.migrate.bits.srcSet, schedule.migrate.bits.srcWay, schedule.migrate.bits.srcTag,
-           schedule.migrate.bits.dstSet, schedule.migrate.bits.dstWay,
-           schedule.migrate.bits.dstVictimTag, schedule.migrate.bits.dstVictimDirty, schedule.migrate.bits.dstVictimValid)
+           schedule.migrate.bits.srcState, schedule.migrate.bits.srcDirty,
+           schedule.migrate.bits.dstSet, schedule.migrate.bits.dstWay)
+  }
+
+  val migratedDstEntry = Wire(new DirectoryEntry(params))
+  migratedDstEntry.tag := migrationReq.srcTag
+  migratedDstEntry.dirty := migrationReq.srcDirty
+  migratedDstEntry.state := migrationReq.srcState
+  migratedDstEntry.clients := migrationReq.srcClients
+  migratedDstEntry.displaced := true.B
+  migratedDstEntry.originSet := migrationReq.srcSet
+  migratedDstEntry.source := migrationReq.srcSource
+
+  val invalidEntry = Wire(new DirectoryEntry(params))
+  invalidEntry.tag := 0.U
+  invalidEntry.dirty := false.B
+  invalidEntry.state := MetaData.INVALID
+  invalidEntry.clients := 0.U
+  invalidEntry.displaced := false.B
+  invalidEntry.originSet := 0.U
+  invalidEntry.source := 0.U
+
+  switch (migrateState) {
+    is (migrateReadReq) {
+      bankedStore.io.migrate_radr.valid := true.B
+      bankedStore.io.migrate_radr.bits.way := migrationReq.srcWay
+      bankedStore.io.migrate_radr.bits.set := migrationReq.srcSet
+      bankedStore.io.migrate_radr.bits.beat := migrationBeat
+      when (bankedStore.io.migrate_radr.fire) {
+        migrationReadDelay := 0.U
+        migrateState := migrateReadWait
+      }
+    }
+    is (migrateReadWait) {
+      migrationReadDelay := migrationReadDelay + 1.U
+      // BankedStore read data appears two cycles after accepted read address.
+      when (migrationReadDelay === 1.U) {
+        migrationReadData := bankedStore.io.migrate_rdat.data
+        migrateState := migrateWriteReq
+      }
+    }
+    is (migrateWriteReq) {
+      bankedStore.io.migrate_wadr.valid := true.B
+      bankedStore.io.migrate_wadr.bits.way := migrationReq.dstWay
+      bankedStore.io.migrate_wadr.bits.set := migrationReq.dstSet
+      bankedStore.io.migrate_wadr.bits.beat := migrationBeat
+      when (bankedStore.io.migrate_wadr.fire) {
+        when (migrationBeat === migrateLastBeat) {
+          migrateState := migrateDirDst
+        } .otherwise {
+          migrationBeat := migrationBeat + 1.U
+          migrateState := migrateReadReq
+        }
+      }
+    }
+    is (migrateDirDst) {
+      migrationDirWrite.valid := true.B
+      migrationDirWrite.bits.set := migrationReq.dstSet
+      migrationDirWrite.bits.way := migrationReq.dstWay
+      migrationDirWrite.bits.data := migratedDstEntry
+      when (directory.io.write.ready) {
+        migrateState := migrateDirSrc
+      }
+    }
+    is (migrateDirSrc) {
+      migrationDirWrite.valid := true.B
+      migrationDirWrite.bits.set := migrationReq.srcSet
+      migrationDirWrite.bits.way := migrationReq.srcWay
+      migrationDirWrite.bits.data := invalidEntry
+      when (directory.io.write.ready) {
+        migrateState := migrateDone
+      }
+    }
+    is (migrateDone) {
+      migrationDonePulse := true.B
+      migrateState := migrateIdle
+      printf("[SSBC MIGRATE] DONE srcSet=%d srcWay=%d -> dstSet=%d dstWay=%d\n",
+             migrationReq.srcSet, migrationReq.srcWay, migrationReq.dstSet, migrationReq.dstWay)
+    }
   }
 
   // Performance monitoring - track directory access and hit/miss

@@ -11,6 +11,7 @@ def parse_log(filepath):
     p_inner_b = re.compile(r'L2 bank=(\d+) INNER.B opcode=(\w+) param=(\d+) size=(\d+) source=\s*(\d+) address=(0x[\da-f]+) tag=(0x[\da-f]+) set=\s*(\d+)(?: beat=(\d+) last=(\d+))?')
     p_inner_c = re.compile(r'L2 bank=(\d+) INNER.C opcode=(\w+) param=(\d+) size=(\d+) source=\s*(\d+) address=(0x[\da-f]+) tag=(0x[\da-f]+) set=\s*(\d+)(?: beat=(\d+) last=(\d+))?')
     p_inner_d = re.compile(r'L2 bank=(\d+) INNER.D opcode=(\w+) param=(\d+) size=(\d+) source=\s*(\d+) sink=(\d+) beat=(\d+) last=(\d+)')
+    p_inner_e = re.compile(r'L2 bank=(\d+) INNER.E opcode=(\w+) sink=(\d+)')
     
     p_outer_a = re.compile(r'L2 bank=(\d+) OUTER.A opcode=(\w+) param=(\d+) size=(\d+) source=(\d+) address=(0x[\da-f]+) tag=(0x[\da-f]+) set=\s*(\d+)(?: beat=(\d+) last=(\d+))?')
     p_outer_c = re.compile(r'L2 bank=(\d+) OUTER.C opcode=(\w+) param=(\d+) size=(\d+) source=(\d+) address=(0x[\da-f]+) tag=(0x[\da-f]+) set=\s*(\d+)(?: beat=(\d+) last=(\d+))?')
@@ -93,6 +94,15 @@ def parse_log(filepath):
                         'opcode': m.group(2),
                         'beat': m.group(7),
                         'last': m.group(8)
+                    })
+                    continue
+
+                m = p_inner_e.search(line)
+                if m:
+                    events.append({
+                        'line': line_num,
+                        'type': 'INNER_E',
+                        'opcode': m.group(2)
                     })
                     continue
 
@@ -430,7 +440,9 @@ def generate_mermaid(events, output_file):
                 info = f"{event['opcode']}"
                 beat_info = get_beat_str(event)
                 if beat_info:
-                     lines_to_write.append(f"    Outer-->>L2_SSBC: {info} {beat_info} [{line_str}]\n")
+                    lines_to_write.append(f"    Outer-->>L2_SSBC: {info} {beat_info} [{line_str}]\n")
+                else:
+                    lines_to_write.append(f"    Outer-->>L2_SSBC: {info} [{line_str}]\n")
 
             elif event['type'] == 'OUTER_E':
                 lines_to_write.append(f"    L2_SSBC->>Outer: [{line_str}] {event['opcode']}\n")
@@ -440,6 +452,11 @@ def generate_mermaid(events, output_file):
                  beat_info = get_beat_str(event)
                  if beat_info:
                      lines_to_write.append(f"    L2_SSBC-->>Inner: {info} {beat_info} [{line_str}]\n")
+                 else:
+                     lines_to_write.append(f"    L2_SSBC-->>Inner: {info} [{line_str}]\n")
+
+            elif event['type'] == 'INNER_E':
+                lines_to_write.append(f"    Inner->>L2_SSBC: [{line_str}] {event['opcode']}\n")
 
             elif event['type'] == 'DIR_WRITE':
                 lines_to_write.append(f"    Note right of L2_SSBC: [{line_str}] Meta Update (Set {event['set']} Way {event['way']} Tag {event['tag']})\n")

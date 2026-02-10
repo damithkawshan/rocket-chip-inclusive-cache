@@ -378,6 +378,11 @@ def generate_mermaid(events, output_file):
                 lines_to_write.append(f"    L2_SSBC->>Inner: {event['opcode']} (Addr: {event['address']}, Set: {event['set']}, Tag: {event['tag']}) [{line_str}]\n")
 
             elif event['type'] == 'INNER_C':
+                # Treat Release or ReleaseData as new transaction boundary
+                if (event['opcode'] in ['Release', 'ReleaseData'] and event.get('beat') == '0'):
+                    transaction_count += 1
+                    lines_to_write.append(f"    Note over Inner, L2_SSBC: [{line_str}] Transaction {transaction_count}: {event['opcode']} (Set: {event['set']}, Tag: {event['tag']})\n")
+                
                 info = f"{event['opcode']} (Addr: {event['address']}, Set: {event['set']}, Tag: {event['tag']})"
                 beat_info = get_beat_str(event)
                 if beat_info:
@@ -437,7 +442,7 @@ def generate_mermaid(events, output_file):
                      lines_to_write.append(f"    L2_SSBC-->>Inner: {info} {beat_info} [{line_str}]\n")
 
             elif event['type'] == 'DIR_WRITE':
-                lines_to_write.append(f"    Note right of L2_SSBC: [{line_str}] DIR_WRITE (Set {event['set']} Way {event['way']} Tag {event['tag']})\n")
+                lines_to_write.append(f"    Note right of L2_SSBC: [{line_str}] Meta Update (Set {event['set']} Way {event['way']} Tag {event['tag']})\n")
 
             # Check if adding these lines would exceed the limit
             if current_lines + len(lines_to_write) > max_lines:
@@ -448,9 +453,7 @@ def generate_mermaid(events, output_file):
             
             for line in lines_to_write:
                 f.write(line)
-            # Each event block adds some lines + maybe newline separator, but since we didn't add separate newline in list
-            f.write("\n")
-            current_lines += len(lines_to_write) + 1
+            current_lines += len(lines_to_write)
 
         f.write(footer)
     print(f"Generated {output_file}")

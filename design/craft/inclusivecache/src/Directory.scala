@@ -295,7 +295,7 @@ class Directory(params: InclusiveCacheParameters) extends Module
   // SSBC: sc bit maintenance (set on displaced-line insertion)
   when (write.valid && wipeDone && ssbcEnabled && write.bits.data.displaced) {
     secondSearchBits(write.bits.data.originSet) := true.B
-    printf("[SSBC] SC_SET: originSet=%d (displaced line inserted into set %d)\n",
+    printf("[InclusiveCache][SSBC Directory] SC_SET: originSet=%d (displaced line inserted into set %d)\n",
            write.bits.data.originSet, write.bits.set)
   }
 
@@ -308,7 +308,7 @@ class Directory(params: InclusiveCacheParameters) extends Module
     }.reverse).orR
     when (!remainingForOrigin) {
       secondSearchBits(write.bits.data.originSet) := false.B
-      printf("[SSBC] SC_CLEAR: originSet=%d (no remaining displaced lines in set %d)\n",
+      printf("[InclusiveCache][SSBC Directory] SC_CLEAR: originSet=%d (no remaining displaced lines in set %d)\n",
              write.bits.data.originSet, write.bits.set)
     }
   }
@@ -316,7 +316,7 @@ class Directory(params: InclusiveCacheParameters) extends Module
   // Log directory writes to track displaced bit
   when (write.valid && wipeDone && ssbcEnabled) {
     val writeData = write.bits.data
-    printf("[SSBC] DIR_WRITE set=%d way=%d tag=0x%x state=%d dirty=%d displaced=%d originSet=%d source=%d clients=0x%x\n",
+    printf("[InclusiveCache][SSBC Directory] DIR_WRITE set=%d way=%d tag=0x%x state=%d dirty=%d displaced=%d originSet=%d source=%d clients=0x%x\n",
            write.bits.set, write.bits.way, writeData.tag, writeData.state, 
            writeData.dirty, writeData.displaced, writeData.originSet, writeData.source, writeData.clients)
   }

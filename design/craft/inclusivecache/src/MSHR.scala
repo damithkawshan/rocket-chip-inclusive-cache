@@ -225,29 +225,38 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   val primary_need_partner = dir_valid && !ssbcNeedPartner && !ssbcWaitPartner &&
     ssbcEnabled && !io.directory.bits.hit && io.directory.bits.scBit
 
-  when (dir_valid) {
-    printf("[MSHR %d] DirectoryResult: set=%d tag=0x%x way=%d hit=%d state=%d clients=0x%x dirty=%d displaced=%d originSet=%d partnerSet=%d partnerWay=%d scBit=%d\n",
-      id.U,
-      io.directory.bits.set,
-      io.directory.bits.tag,
-      io.directory.bits.way,
-      io.directory.bits.hit,
-      io.directory.bits.state,
-      io.directory.bits.clients,
-      io.directory.bits.dirty,
-      io.directory.bits.displaced,
-      io.directory.bits.originSet,
-      io.directory.bits.partnerSet,
-      io.directory.bits.partnerWay,
-      io.directory.bits.scBit
-    )
-  }
+  // when (dir_valid) {
+  //   printf("[MSHR %d] DirectoryResult: set=%d tag=0x%x way=%d hit=%d state=%d clients=0x%x dirty=%d displaced=%d originSet=%d partnerSet=%d partnerWay=%d scBit=%d\n",
+  //     id.U,
+  //     io.directory.bits.set,
+  //     io.directory.bits.tag,
+  //     io.directory.bits.way,
+  //     io.directory.bits.hit,
+  //     io.directory.bits.state,
+  //     io.directory.bits.clients,
+  //     io.directory.bits.dirty,
+  //     io.directory.bits.displaced,
+  //     io.directory.bits.originSet,
+  //     io.directory.bits.partnerSet,
+  //     io.directory.bits.partnerWay,
+  //     io.directory.bits.scBit
+  //   )
+  // }
 
   when (primary_need_partner) {
     ssbcPrimary := io.directory.bits
     ssbcNeedPartner := true.B
-    printf("[SSBC MSHR %d] PRIMARY_MISS set=%d tag=0x%x sc=1 -> partner lookup\n",
-           id.U, io.directory.bits.set, io.directory.bits.tag)
+    printf("[InclusiveCache][SSBC MSHR %d] PRIMARY_MISS origSet=%d origWay=%d origTag=0x%x scBit=%d -> partnerSet=%d lookup\n",
+           id.U, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag, io.directory.bits.scBit, io.directory.bits.partnerSet)
+  }
+  when (dir_valid && !ssbcNeedPartner && !ssbcWaitPartner && ssbcEnabled && !io.directory.bits.hit && !io.directory.bits.scBit) {
+    printf("[InclusiveCache][SSBC MSHR %d] PRIMARY_MISS origSet=%d origWay=%d origTag=0x%x scBit=%d (no secondary search)\n",
+           id.U, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag, io.directory.bits.scBit)
+  }
+
+  when (dir_valid && !ssbcNeedPartner && !ssbcWaitPartner && ssbcEnabled && io.directory.bits.hit) {
+    printf("[InclusiveCache][SSBC MSHR %d] PRIMARY_HIT origSet=%d origWay=%d origTag=0x%x\n",
+           id.U, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag)
   }
 
   when (ssbcNeedPartner && io.partnerReadGrant) {
@@ -269,11 +278,11 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   when (ssbcWaitPartner && dir_valid) {
     ssbcWaitPartner := false.B
     when (secondary_hit) {
-      printf("[SSBC MSHR %d] SECONDARY_HIT origSet=%d partnerSet=%d way=%d tag=0x%x\n",
+      printf("[InclusiveCache][SSBC MSHR %d] SECONDARY_HIT origSet=%d partnerSet=%d partnerWay=%d partnerTag=0x%x\n",
              id.U, ssbcPrimary.set, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag)
     } .otherwise {
-      printf("[SSBC MSHR %d] SECONDARY_MISS origSet=%d partnerSet=%d tag=0x%x\n",
-             id.U, ssbcPrimary.set, io.directory.bits.set, io.directory.bits.tag)
+      printf("[InclusiveCache][SSBC MSHR %d] SECONDARY_MISS origSet=%d partnerSet=%d partnerWay=%d partnerTag=0x%x\n",
+             id.U, ssbcPrimary.set, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag)
     }
   }
 
@@ -287,7 +296,7 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
 
   // SSBC displacement decision (controller-side)
   val shouldMigrate = ssbcEnabled && !dir_final.hit && (dir_final.state =/= INVALID) &&
-                      (dir_final.currentSat === ssbcSatMax) &&
+                      (dir_final.currentSat >= ssbcSatMax) &&
                       (dir_final.partnerSat < ssbcSatLow)
   // Migration datapath (actual line move + dual-directory update) is not complete yet.
   // Keep decision visibility, but execute normal eviction until datapath support is added.
@@ -334,7 +343,7 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
     w_rprobeackfirst := true.B
     w_rprobeacklast := true.B
     w_releaseack := true.B
-    printf("[SSBC TMP %d] PARTNER_EVICT_DONE set=%d way=%d tag=0x%x\n",
+    printf("[InclusiveCache][SSBC MSHR %d] PARTNER_EVICT_DONE partnerSet=%d partnerWay=%d partnerTag=0x%x\n",
            id.U, migrate_partnerSet, migrate_partnerWay, migrate_partnerVictimTag)
   }
   // Acquire is only legal once migration (if any) has actually completed.
@@ -401,7 +410,7 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
 
   when (io.migrateDone) {
     w_migrate_done := true.B
-    printf("[SSBC MSHR %d] MIGRATE_DONE srcSet=%d srcWay=%d dstSet=%d dstWay=%d\n",
+    printf("[InclusiveCache][SSBC MSHR %d] MIGRATE_DONE origSet=%d origWay=%d partnerSet=%d partnerWay=%d\n",
            id.U, request.set, meta.way, migrate_partnerSet, migrate_partnerWay)
   }
   
@@ -414,14 +423,14 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
     migrate_partnerVictimValid := io.partnerResult.bits.victimValid
     migrate_partnerVictimClients := io.partnerResult.bits.victimClients
     migrate_partnerVictimState := io.partnerResult.bits.victimState
-    printf("[SSBC MSHR %d] PARTNER_LOOKUP partnerSet=%d way=%d tag=0x%x dirty=%d valid=%d\n",
+    printf("[InclusiveCache][SSBC MSHR %d] PARTNER_LOOKUP partnerSet=%d partnerWay=%d partnerTag=0x%x dirty=%d valid=%d\n",
            id.U, migrate_partnerSet, io.partnerResult.bits.way, io.partnerResult.bits.victimTag,
            io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimValid)
 
     // Step 1: handle partner victim eviction before migration
     when (io.partnerResult.bits.victimValid) {
       migrate_evict_partner := true.B
-      printf("[SSBC TMP %d] PARTNER_EVICT_START set=%d way=%d tag=0x%x dirty=%d clients=0x%x state=%d\n",
+      printf("[InclusiveCache][SSBC MSHR %d] PARTNER_EVICT_START partnerSet=%d partnerWay=%d partnerTag=0x%x dirty=%d clients=0x%x state=%d\n",
              id.U, migrate_partnerSet, migrate_partnerWay, io.partnerResult.bits.victimTag,
              io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimClients,
              io.partnerResult.bits.victimState)
@@ -457,12 +466,6 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   val evictDirty = Mux(migrate_evict_partner, migrate_partnerVictimDirty, meta.dirty)
   val evictState = Mux(migrate_evict_partner, migrate_partnerVictimState, meta.state)
   val evictClients = Mux(migrate_evict_partner, migrate_partnerVictimClients, meta.clients)
-
-  // when (request_valid) {
-  //   printf("MSHR: Valid request - source=0x%x, clientBit=0x%x, clientId=%d, opcode=0x%x, addr=0x%x\n",
-  //     request.source, req_clientBit, OHToUInt(req_clientBit), request.opcode, 
-  //     Cat(request.tag, request.set, 0.U(log2Ceil(params.cache.blockBytes).W)))
-  // }
 
   when (request.prio(2) && (!params.firstLevel).B) { // always a hit
     final_meta_writeback.dirty   := meta.dirty || request.opcode(0)
@@ -720,7 +723,8 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   val probe_toN = isToN(io.sinkc.bits.param)
   if (!params.firstLevel) when (io.sinkc.valid) {
     when (migrate_evict_partner) {
-      printf("[SSBC TMP] PARTNER_PROBE_ACK src=%d set=%d tag=0x%x done=0x%x target=0x%x last=%d\n",
+      printf("[InclusiveCache][SSBC MSHR %d] PARTNER_PROBE_ACK src=%d set=%d tag=0x%x done=0x%x target=0x%x last=%d\n",
+             id.U,
              io.sinkc.bits.source, io.sinkc.bits.set, io.sinkc.bits.tag,
              probes_done | probe_bit, probe_target_clients, last_probe)
     }
@@ -841,7 +845,7 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
     migrate_valid    := false.B
     
     when (dir_final_valid && shouldMigrate && !migrationPathReady) {
-      printf("[SSBC MSHR %d] MIGRATE_BYPASS srcSet=%d srcTag=0x%x (decision=1, path=normal-evict)\n",
+      printf("[InclusiveCache][SSBC MSHR %d] MIGRATE_BYPASS srcSet=%d srcTag=0x%x (decision=1, path=normal-evict)\n",
              id.U, dir_final.set, dir_final.tag)
     }
 
@@ -850,7 +854,7 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
       migrate_valid := true.B
       migrate_partnerSet := dir_final.partnerSet
       migrate_partnerWay := dir_final.partnerWay
-      printf("[SSBC MSHR %d] MIGRATE_TRIGGER srcSet=%d srcTag=0x%x -> partnerSet=%d partnerWay=%d\n",
+      printf("[InclusiveCache][SSBC MSHR %d] MIGRATE_TRIGGER srcSet=%d srcTag=0x%x -> partnerSet=%d partnerWay=%d\n",
              id.U, dir_final.set, dir_final.tag, 
              dir_final.partnerSet, dir_final.partnerWay)
     }

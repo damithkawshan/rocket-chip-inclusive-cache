@@ -494,11 +494,10 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
                                     Mux(req_acquire, req_clientBit, 0.U)
     final_meta_writeback.tag := request.tag
     final_meta_writeback.hit := true.B
-    // For normal allocation, line is native (not displaced from partner set)
-    // TODO: Set to true.B when implementing SSBC displacement logic for lines migrated from partner
-    final_meta_writeback.displaced := false.B
-    // SSBC: default origin is the request's logical set
-    final_meta_writeback.originSet := request.set
+    // Preserve displaced metadata on hits so SSBC secondary lookup remains valid.
+    // Fresh allocations are native to the request set.
+    final_meta_writeback.displaced := Mux(meta.hit, meta.displaced, false.B)
+    final_meta_writeback.originSet := Mux(meta.hit && meta.displaced, meta.originSet, request.set)
     when (request.prio(0)) {
       final_meta_writeback.source := request.source
     }

@@ -20,8 +20,11 @@ def parse_log(filepath):
     
     p_primary_miss = re.compile(r'\[SSBC MSHR (\d+)\] PRIMARY_MISS origSet=\s*(\d+) origWay=(\d+) origTag=(0x[\da-f]+) scBit=(\d+)')
     p_primary_hit = re.compile(r'\[SSBC MSHR (\d+)\] PRIMARY_HIT origSet=\s*(\d+) origWay=(\d+) origTag=(0x[\da-f]+)')
+
+    p_secondary_miss = re.compile(r'\[SSBC MSHR (\d+)\] SECONDARY_MISS origSet=\s*(\d+)(?:\s+partnerSet=\s*(\d+) partnerWay=(\d+) partnerTag=(0x[\da-f]+))?')
+    p_secondary_hit = re.compile(r'\[SSBC MSHR (\d+)\] SECONDARY_HIT origSet=\s*(\d+)(?:\s+partnerSet=\s*(\d+) partnerWay=(\d+) partnerTag=(0x[\da-f]+))?')
     
-    p_dir_write = re.compile(r'\[SSBC Directory\] KDIR_WRITE set=\s*(\d+) way=(\d+) tag=(0x[\da-f]+) state=(\d+) dirty=(\d+) displaced=(\d+) originSet=\s*(\d+)')
+    p_dir_write = re.compile(r'\[SSBC Directory\] DIR_WRITE set=\s*(\d+) way=(\d+) tag=(0x[\da-f]+) state=(\d+) dirty=(\d+) displaced=(\d+) originSet=\s*(\d+)')
     
     p_migrate_trigger = re.compile(r'\[SSBC MSHR (\d+)\] MIGRATE_TRIGGER srcSet=\s*(\d+) srcTag=(0x[\da-f]+) -> partnerSet=\s*(\d+) partnerWay=(\d+)')
     p_partner_lookup = re.compile(r'\[SSBC MSHR (\d+)\] PARTNER_LOOKUP partnerSet=\s*(\d+) way=(\d+) tag=(0x[\da-f]+) dirty=(\d+) valid=(\d+)')
@@ -163,6 +166,36 @@ def parse_log(filepath):
                         'way': m.group(3),
                         'tag': m.group(4)
                     })
+                    continue
+
+                m = p_secondary_miss.search(line)
+                if m:
+                    event = {
+                        'line': line_num,
+                        'type': 'SECONDARY_MISS',
+                        'mshr': m.group(1),
+                        'set': m.group(2)
+                    }
+                    if m.group(3):
+                        event['partnerSet'] = m.group(3)
+                        event['partnerWay'] = m.group(4)
+                        event['partnerTag'] = m.group(5)
+                    events.append(event)
+                    continue
+
+                m = p_secondary_hit.search(line)
+                if m:
+                    event = {
+                        'line': line_num,
+                        'type': 'SECONDARY_HIT',
+                        'mshr': m.group(1),
+                        'set': m.group(2)
+                    }
+                    if m.group(3):
+                        event['partnerSet'] = m.group(3)
+                        event['partnerWay'] = m.group(4)
+                        event['partnerTag'] = m.group(5)
+                    events.append(event)
                     continue
 
                 m = p_dir_write.search(line)
@@ -353,11 +386,23 @@ def generate_mermaid(events, output_file):
                     lines_to_write.append(f"    Inner->>L2_SSBC: {info} [{line_str}]\n")
 
             elif event['type'] == 'PRIMARY_MISS':
-                lines_to_write.append(f"    L2_SSBC->>L2_SSBC: [{line_str}] Primary Miss [MSHR {event['mshr']}] (Set {event['set']} Way {event['way']} | Tag {event['tag']})\n")
+                lines_to_write.append(f"    L2_SSBC->>L2_SSBC: [{line_str}] Primary Miss [MSHR {event['mshr']}] (victim : Set: {event['set']}, Tag: {event['tag']} | Way: {event['way']})\n")
             
             elif event['type'] == 'PRIMARY_HIT':
                 lines_to_write.append(f"    L2_SSBC->>L2_SSBC: [{line_str}] Primary Hit [MSHR {event['mshr']}] (Set {event['set']} Way {event['way']} | Tag {event['tag']})\n")
             
+            elif event['type'] == 'SECONDARY_MISS':
+                msg = f"Secondary Miss [MSHR {event['mshr']}] (Set {event['set']})"
+                if 'partnerSet' in event:
+                    msg += f" | In Partner (victim : Set: {event['partnerSet']}, Tag: {event['partnerTag']} | Way: {event['partnerWay']})"
+                lines_to_write.append(f"    L2_SSBC->>L2_SSBC: [{line_str}] {msg}\n")
+
+            elif event['type'] == 'SECONDARY_HIT':
+                msg = f"Secondary Hit [MSHR {event['mshr']}] (Set {event['set']})"
+                if 'partnerSet' in event:
+                    msg += f" | Partner: Set {event['partnerSet']} Way {event['partnerWay']} Tag {event['partnerTag']}"
+                lines_to_write.append(f"    L2_SSBC->>L2_SSBC: [{line_str}] {msg}\n")
+
             elif event['type'] == 'MIGRATE_TRIGGER':
                 lines_to_write.append(f"    Note over L2_SSBC, Outer: [{line_str}] Migration Triggered [MSHR {event['mshr']}]\n")
                 lines_to_write.append(f"    L2_SSBC->>L2_SSBC: Migrate Tag {event['srcTag']} (Set {event['srcSet']}) -> Set {event['dstSet']} Way {event['dstWay']}\n")

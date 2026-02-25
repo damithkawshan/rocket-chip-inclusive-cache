@@ -117,7 +117,7 @@ class InclusiveCache(
     node.edges.in.headOption.foreach { n =>
       println(s"L${cache.level} InclusiveCache Client Map:")
       n.client.clients.zipWithIndex.foreach { case (c,i) =>
-        println(s"\t${i} <= ${c.name}")
+        println(s"\t${i} <= ${c.name} (sourceId ${c.sourceId.start}-${c.sourceId.end})")
       }
       println("")
     }
@@ -126,6 +126,8 @@ class InclusiveCache(
     val hitCounter = RegInit(0.U(64.W))
     val missCounter = RegInit(0.U(64.W))
     val totalAccessCounter = RegInit(0.U(64.W))
+    val cycleCount = RegInit(0.U(64.W))
+    cycleCount := cycleCount + 1.U
 
     if (cache.ssbcEnabled) {
       println(s"[InclusiveCache] L${cache.level} SSBC enabled (sets=${cache.sets}, ways=${cache.ways})")
@@ -157,24 +159,49 @@ class InclusiveCache(
         val (_, last, _, beat) = edgeIn.count(in.a)
         val prefix = p"[InclusiveCache] L2 bank=$i INNER.A opcode="
         val (tag,set,offset) = params.parseAddress(in.a.bits.address)
+        val userSuffix = if (in.a.bits.user.elements.nonEmpty) {
+          p" user=0x${Hexadecimal(in.a.bits.user.asUInt)}"
+        } else {
+          p" user=none"
+        }
         val suffix = p" param=${in.a.bits.param} size=${in.a.bits.size} source=${in.a.bits.source} " +
-          p"address=0x${Hexadecimal(in.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} beat=${beat} last=${last}\n"
+          p"address=0x${Hexadecimal(in.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+          p"beat=${beat} last=${last} mask=0x${Hexadecimal(in.a.bits.mask)} cycle=${cycleCount}${userSuffix}\n"
         when (in.a.bits.opcode === TLMessages.AcquireBlock) {
           printf(prefix + "AcquireBlock" + suffix)
         }.elsewhen (in.a.bits.opcode === TLMessages.AcquirePerm) {
           printf(prefix + "AcquirePerm" + suffix)
         }.elsewhen (in.a.bits.opcode === TLMessages.ArithmeticData) {
-          printf(prefix + "ArithmeticData" + suffix)
+          val arithSuffix = p" param=${in.a.bits.param} size=${in.a.bits.size} source=${in.a.bits.source} " +
+            p"address=0x${Hexadecimal(in.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} mask=0x${Hexadecimal(in.a.bits.mask)} " +
+            p"data=0x${Hexadecimal(in.a.bits.data)} cycle=${cycleCount}${userSuffix}\n"
+          printf(prefix + "ArithmeticData" + arithSuffix)
         }.elsewhen (in.a.bits.opcode === TLMessages.LogicalData) {
-          printf(prefix + "LogicalData" + suffix)
+          val logicSuffix = p" param=${in.a.bits.param} size=${in.a.bits.size} source=${in.a.bits.source} " +
+            p"address=0x${Hexadecimal(in.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} mask=0x${Hexadecimal(in.a.bits.mask)} " +
+            p"data=0x${Hexadecimal(in.a.bits.data)} cycle=${cycleCount}${userSuffix}\n"
+          printf(prefix + "LogicalData" + logicSuffix)
         }.elsewhen (in.a.bits.opcode === TLMessages.Get) {
           printf(prefix + "Get" + suffix)
+          printf(p"[InclusiveCache] L2 bank=$i INNER.A GET_DETAIL cycle=${cycleCount} source=${in.a.bits.source} " +
+            p"address=0x${Hexadecimal(in.a.bits.address)} size=${in.a.bits.size} " +
+            p"mask=0x${Hexadecimal(in.a.bits.mask)} opcode=${in.a.bits.opcode} param=${in.a.bits.param}${userSuffix}\n")
         }.elsewhen (in.a.bits.opcode === TLMessages.Hint) {
           printf(prefix + "Hint" + suffix)
         }.elsewhen (in.a.bits.opcode === TLMessages.PutFullData) {
-          printf(prefix + "PutFullData" + suffix)
+          val pfdSuffix = p" param=${in.a.bits.param} size=${in.a.bits.size} source=${in.a.bits.source} " +
+            p"address=0x${Hexadecimal(in.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} mask=0x${Hexadecimal(in.a.bits.mask)} " +
+            p"data=0x${Hexadecimal(in.a.bits.data)} cycle=${cycleCount}${userSuffix}\n"
+          printf(prefix + "PutFullData" + pfdSuffix)
         }.elsewhen (in.a.bits.opcode === TLMessages.PutPartialData) {
-          printf(prefix + "PutPartialData" + suffix)
+          val ppdSuffix = p" param=${in.a.bits.param} size=${in.a.bits.size} source=${in.a.bits.source} " +
+            p"address=0x${Hexadecimal(in.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} mask=0x${Hexadecimal(in.a.bits.mask)} " +
+            p"data=0x${Hexadecimal(in.a.bits.data)} cycle=${cycleCount}${userSuffix}\n"
+          printf(prefix + "PutPartialData" + ppdSuffix)
         }.otherwise {
           printf(prefix + "unknown" + suffix)
         }
@@ -187,9 +214,15 @@ class InclusiveCache(
         val suffix = p" param=${in.b.bits.param} size=${in.b.bits.size} source=${in.b.bits.source} " +
           p"address=0x${Hexadecimal(in.b.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} beat=${beat} last=${last}\n"
         when (in.b.bits.opcode === TLMessages.PutFullData) {
-          printf(prefix + "PutFullData" + suffix)
+          val pfdSuffix = p" param=${in.b.bits.param} size=${in.b.bits.size} source=${in.b.bits.source} " +
+            p"address=0x${Hexadecimal(in.b.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(in.b.bits.data)}\n"  
+          printf(prefix + "PutFullData" + pfdSuffix)
         }.elsewhen (in.b.bits.opcode === TLMessages.PutPartialData) {
-          printf(prefix + "PutPartialData" + suffix)
+          val ppdSuffix = p" param=${in.b.bits.param} size=${in.b.bits.size} source=${in.b.bits.source} " +
+            p"address=0x${Hexadecimal(in.b.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(in.b.bits.data)}\n"
+          printf(prefix + "PutPartialData" + ppdSuffix)
         }.elsewhen (in.b.bits.opcode === TLMessages.ArithmeticData) {
           printf(prefix + "ArithmeticData" + suffix)
         }.elsewhen (in.b.bits.opcode === TLMessages.LogicalData) {
@@ -214,17 +247,26 @@ class InclusiveCache(
         when (in.c.bits.opcode === TLMessages.AccessAck) {
           printf(prefix + "AccessAck" + suffix)
         }.elsewhen (in.c.bits.opcode === TLMessages.AccessAckData) {
-          printf(prefix + "AccessAckData" + suffix)
+          val aadSuffix = p" param=${in.c.bits.param} size=${in.c.bits.size} source=${in.c.bits.source} " +
+            p"address=0x${Hexadecimal(in.c.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(in.c.bits.data)}\n"
+          printf(prefix + "AccessAckData" + aadSuffix)
         }.elsewhen (in.c.bits.opcode === TLMessages.HintAck) {
           printf(prefix + "HintAck" + suffix)
         }.elsewhen (in.c.bits.opcode === TLMessages.ProbeAck) {
           printf(prefix + "ProbeAck" + suffix)
         }.elsewhen (in.c.bits.opcode === TLMessages.ProbeAckData) {
-          printf(prefix + "ProbeAckData" + suffix)
+          val padSuffix = p" param=${in.c.bits.param} size=${in.c.bits.size} source=${in.c.bits.source} " +
+            p"address=0x${Hexadecimal(in.c.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(in.c.bits.data)}\n"
+          printf(prefix + "ProbeAckData" + padSuffix)
         }.elsewhen (in.c.bits.opcode === TLMessages.Release) {
           printf(prefix + "Release" + suffix)
         }.elsewhen (in.c.bits.opcode === TLMessages.ReleaseData) {
-          printf(prefix + "ReleaseData" + suffix)
+          val rlsSuffix = p" param=${in.c.bits.param} size=${in.c.bits.size} source=${in.c.bits.source} " +
+            p"address=0x${Hexadecimal(in.c.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(in.c.bits.data)}\n"
+          printf(prefix + "ReleaseData" + rlsSuffix)
         }.otherwise {
           printf(prefix + "unknown" + suffix)
         }
@@ -233,15 +275,22 @@ class InclusiveCache(
       when (in.d.fire) {
         val (_, last, _, beat) = edgeIn.count(in.d)
         val prefix = p"[InclusiveCache] L2 bank=$i INNER.D opcode="
-        val suffix = p" param=${in.d.bits.param} size=${in.d.bits.size} source=${in.d.bits.source} sink=${in.d.bits.sink} beat=${beat} last=${last}\n"
+        val suffix = p" param=${in.d.bits.param} size=${in.d.bits.size} source=${in.d.bits.source} " +
+          p"sink=${in.d.bits.sink} beat=${beat} last=${last} cycle=${cycleCount}\n"
         when (in.d.bits.opcode === TLMessages.AccessAck) {
           printf(prefix + "AccessAck" + suffix)
         }.elsewhen (in.d.bits.opcode === TLMessages.AccessAckData) {
-          printf(prefix + "AccessAckData" + suffix)
+          val aadSuffix = p" param=${in.d.bits.param} size=${in.d.bits.size} source=${in.d.bits.source} " +
+            p"sink=${in.d.bits.sink} beat=${beat} last=${last} cycle=${cycleCount} " +
+            p"data=0x${Hexadecimal(in.d.bits.data)}\n"
+          printf(prefix + "AccessAckData" + aadSuffix)
         }.elsewhen (in.d.bits.opcode === TLMessages.Grant) {
           printf(prefix + "Grant" + suffix)
         }.elsewhen (in.d.bits.opcode === TLMessages.GrantData) {
-          printf(prefix + "GrantData" + suffix)
+          val gdSuffix = p" param=${in.d.bits.param} size=${in.d.bits.size} source=${in.d.bits.source} " +
+            p"sink=${in.d.bits.sink} beat=${beat} last=${last} cycle=${cycleCount} " +
+            p"data=0x${Hexadecimal(in.d.bits.data)}\n"
+          printf(prefix + "GrantData" + gdSuffix)
         }.elsewhen (in.d.bits.opcode === TLMessages.ReleaseAck) {
           printf(prefix + "ReleaseAck" + suffix)
         }.elsewhen (in.d.bits.opcode === TLMessages.HintAck) {
@@ -270,13 +319,25 @@ class InclusiveCache(
         }.elsewhen (out.a.bits.opcode === TLMessages.AcquirePerm) {
           printf(prefix + "AcquirePerm" + suffix)
         }.elsewhen (out.a.bits.opcode === TLMessages.PutFullData) {
-          printf(prefix + "PutFullData" + suffix)
+          val pfdSuffix = p" param=${out.a.bits.param} size=${out.a.bits.size} source=${out.a.bits.source} " +
+            p"address=0x${Hexadecimal(out.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(out.a.bits.data)}\n"
+          printf(prefix + "PutFullData" + pfdSuffix)
         }.elsewhen (out.a.bits.opcode === TLMessages.PutPartialData) {
-          printf(prefix + "PutPartialData" + suffix)
+          val ppdSuffix = p" param=${out.a.bits.param} size=${out.a.bits.size} source=${out.a.bits.source} " +
+            p"address=0x${Hexadecimal(out.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(out.a.bits.data)}\n"
+          printf(prefix + "PutPartialData" + ppdSuffix)
         }.elsewhen (out.a.bits.opcode === TLMessages.ArithmeticData) {
-          printf(prefix + "ArithmeticData" + suffix)
+          val arithSuffix = p" param=${out.a.bits.param} size=${out.a.bits.size} source=${out.a.bits.source} " +
+            p"address=0x${Hexadecimal(out.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(out.a.bits.data)}\n"
+          printf(prefix + "ArithmeticData" + arithSuffix)
         }.elsewhen (out.a.bits.opcode === TLMessages.LogicalData) {
-          printf(prefix + "LogicalData" + suffix)
+          val logicSuffix = p" param=${out.a.bits.param} size=${out.a.bits.size} source=${out.a.bits.source} " +
+            p"address=0x${Hexadecimal(out.a.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(out.a.bits.data)}\n"
+          printf(prefix + "LogicalData" + logicSuffix)
         }.elsewhen (out.a.bits.opcode === TLMessages.Get) {
           printf(prefix + "Get" + suffix)
         }.elsewhen (out.a.bits.opcode === TLMessages.Hint) {
@@ -295,7 +356,10 @@ class InclusiveCache(
         when (out.b.bits.opcode === TLMessages.PutFullData) {
           printf(prefix + "PutFullData" + suffix)
         }.elsewhen (out.b.bits.opcode === TLMessages.PutPartialData) {
-          printf(prefix + "PutPartialData" + suffix)
+          val ppdSuffix = p" param=${out.b.bits.param} size=${out.b.bits.size} source=${out.b.bits.source} " +
+            p"address=0x${Hexadecimal(out.b.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(out.b.bits.data)}\n"
+          printf(prefix + "PutPartialData" + ppdSuffix)
         }.elsewhen (out.b.bits.opcode === TLMessages.ArithmeticData) {
           printf(prefix + "ArithmeticData" + suffix)
         }.elsewhen (out.b.bits.opcode === TLMessages.LogicalData) {
@@ -326,11 +390,17 @@ class InclusiveCache(
         }.elsewhen (out.c.bits.opcode === TLMessages.ProbeAck) {
           printf(prefix + "ProbeAck" + suffix)
         }.elsewhen (out.c.bits.opcode === TLMessages.ProbeAckData) {
-          printf(prefix + "ProbeAckData" + suffix)
+          val padSuffix = p" param=${out.c.bits.param} size=${out.c.bits.size} source=${out.c.bits.source} " +
+            p"address=0x${Hexadecimal(out.c.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(out.c.bits.data)}\n"
+          printf(prefix + "ProbeAckData" + padSuffix)
         }.elsewhen (out.c.bits.opcode === TLMessages.Release) {
           printf(prefix + "Release" + suffix)
         }.elsewhen (out.c.bits.opcode === TLMessages.ReleaseData) {
-          printf(prefix + "ReleaseData" + suffix)
+          val rlsSuffix = p" param=${out.c.bits.param} size=${out.c.bits.size} source=${out.c.bits.source} " +
+            p"address=0x${Hexadecimal(out.c.bits.address)} tag=0x${Hexadecimal(tag)} set=${set} " +
+            p"beat=${beat} last=${last} data=0x${Hexadecimal(out.c.bits.data)}\n"
+          printf(prefix + "ReleaseData" + rlsSuffix)
         }.otherwise {
           printf(prefix + "unknown" + suffix)
         }
@@ -343,13 +413,17 @@ class InclusiveCache(
         when (out.d.bits.opcode === TLMessages.AccessAck) {
           printf(prefix + "AccessAck" + suffix)
         }.elsewhen (out.d.bits.opcode === TLMessages.AccessAckData) {
-          printf(prefix + "AccessAckData" + suffix)
+          val aadSuffix = p" param=${out.d.bits.param} size=${out.d.bits.size} source=${out.d.bits.source} " +
+            p"sink=${out.d.bits.sink} beat=${beat} last=${last} data=0x${Hexadecimal(out.d.bits.data)}\n"
+          printf(prefix + "AccessAckData" + aadSuffix)
         }.elsewhen (out.d.bits.opcode === TLMessages.HintAck) {
           printf(prefix + "HintAck" + suffix)
         }.elsewhen (out.d.bits.opcode === TLMessages.Grant) {
           printf(prefix + "Grant" + suffix)
         }.elsewhen (out.d.bits.opcode === TLMessages.GrantData) {
-          printf(prefix + "GrantData" + suffix)
+          val gdSuffix = p" param=${out.d.bits.param} size=${out.d.bits.size} source=${out.d.bits.source} " +
+            p"sink=${out.d.bits.sink} beat=${beat} last=${last} data=0x${Hexadecimal(out.d.bits.data)}\n"
+          printf(prefix + "GrantData" + gdSuffix)
         }.elsewhen (out.d.bits.opcode === TLMessages.ReleaseAck) {
           printf(prefix + "ReleaseAck" + suffix)
         }.otherwise {

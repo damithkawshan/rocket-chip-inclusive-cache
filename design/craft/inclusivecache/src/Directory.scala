@@ -199,9 +199,32 @@ class Directory(params: InclusiveCacheParameters) extends Module
 
   val setQuash = bypass_valid && bypass.set === set
   val tagMatch = bypass.data.tag === tag
-  val wayMatch = bypass.way === victimWay
+  // wayMatch is defined below after finalVictimWay is computed
 
   val ways = regout.map(d => d.asTypeOf(new DirectoryEntry(params)))
+
+  // SSBC: Prefer non-displaced (native) ways as eviction victims.
+  // If any way in this set is NOT displaced, restrict victim selection to those ways.
+  // Only fall back to the random LFSR victim when ALL ways are displaced.
+  val nativeWayMask = VecInit(ways.map(w => !w.displaced)).asUInt  // 1 = native, 0 = displaced
+  val allWaysDisplaced = !nativeWayMask.orR
+
+  // Pseudo-random selection among native ways, anchored at the LFSR-selected index:
+  //   1. Rotate nativeWayMask right by victimWay  → bring LFSR position to bit-0.
+  //   2. Take the lowest set bit                   → nearest native way from that position.
+  //   3. Rotate the result back left by victimWay  → restore original way numbering.
+  val rotatedNativeMask  = (Cat(nativeWayMask, nativeWayMask) >> victimWay)(params.cache.ways-1, 0)
+  val firstNativeRotated = rotatedNativeMask & (~rotatedNativeMask + 1.U)   // lowest set bit
+  val firstNativePadded  = Cat(0.U(params.cache.ways.W), firstNativeRotated) // zero-extend to 2*N bits
+  val firstNativeShifted = (firstNativePadded << victimWay)(2*params.cache.ways-1, 0)
+  // Fold the 2*N bits back to N bits (handle wrap-around):
+  val nativeVictimWayOH  = firstNativeShifted(params.cache.ways-1, 0) |
+                           firstNativeShifted(2*params.cache.ways-1, params.cache.ways)
+
+  // Final victim: native way when available, LFSR victim when all ways are displaced
+  val finalVictimWayOH = Mux(!ssbcEnabled || allWaysDisplaced, victimWayOH, nativeVictimWayOH)
+  val finalVictimWay   = OHToUInt(finalVictimWayOH)
+  val wayMatch         = bypass.way === finalVictimWay
   val hits = Cat(ways.zipWithIndex.map { case (w, i) =>
     w.tag === tag && w.state =/= INVALID && (!setQuash || i.U =/= bypass.way)
   }.reverse)
@@ -226,14 +249,21 @@ class Directory(params: InclusiveCacheParameters) extends Module
   //   3) Partner set is underutilized (counter < K)
   //   4) The victim way has valid data to migrate
   val hitEntry = Mux(setQuash && tagMatch, bypass.data, Mux1H(hits, ways))
-  val victimEntry = Mux(setQuash && (tagMatch || wayMatch), bypass.data, Mux1H(victimWayOH, ways))
+  val victimEntry = Mux(setQuash && (tagMatch || wayMatch), bypass.data, Mux1H(finalVictimWayOH, ways))
   val victimValid = victimEntry.state =/= INVALID  // Victim must be valid to migrate
   val resultEntry = Mux(hit, hitEntry, victimEntry)
+
+  // SSBC: Log when we fall back to evicting a displaced line (all ways are displaced).
+  when (ren2 && primaryMiss && victimEntry.displaced) {
+    printf("[InclusiveCache][SSBC Directory] VICTIM_DISPLACED_FALLBACK: set=%d way=%d all ways displaced, forced to evict displaced line\n",
+           set, finalVictimWay)
+  }
+
 
   io.result.valid := ren2
   io.result.bits.viewAsSupertype(chiselTypeOf(bypass.data)) := resultEntry
   io.result.bits.hit := hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
-  io.result.bits.way := Mux(hit, OHToUInt(hits), Mux(setQuash && tagMatch, bypass.way, victimWay))
+  io.result.bits.way := Mux(hit, OHToUInt(hits), Mux(setQuash && tagMatch, bypass.way, finalVictimWay))
   io.result.bits.set := set
   io.result.bits.scBit := secondSearchBits(set)
   io.result.bits.partnerScBit := secondSearchBits(partnerSet)

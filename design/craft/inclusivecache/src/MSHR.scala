@@ -189,6 +189,9 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   val s_execute        = RegInit(true.B) // D  w_pprobeack, w_grant
   val w_grantack       = RegInit(true.B)
   val s_writeback      = RegInit(true.B) // W  w_*
+  // For dirty evictions: directory slot must not be cleared until w_releaseack confirms
+  // DRAM has accepted the dirty data, preventing a re-acquire from fetching stale data.
+  val s_dir_evict      = RegInit(true.B) // DIR INVALID write (only after w_releaseack for dirty lines)
   
   // Migration states
   val s_migrate_lookup = RegInit(true.B)  // Request partner set lookup
@@ -201,6 +204,8 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   val migrate_partnerSet = Reg(UInt(params.setBits.W))
   val migrate_partnerWay = Reg(UInt(params.wayBits.W))
   val migrate_partnerVictimTag = Reg(UInt(params.tagBits.W))
+  val migrate_partnerDisplaced = Reg(Bool())
+  val migrate_partnerVictimOriginSet = Reg(UInt(params.setBits.W))
   val migrate_partnerVictimDirty = Reg(Bool())
   val migrate_partnerVictimValid = Reg(Bool())
   val migrate_partnerVictimClients = Reg(UInt(params.clientBits.W))
@@ -246,12 +251,12 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   when (primary_need_partner) {
     ssbcPrimary := io.directory.bits
     ssbcNeedPartner := true.B
-    printf("[InclusiveCache][SSBC MSHR %d] PRIMARY_MISS origSet=%d origWay=%d origTag=0x%x scBit=%d -> partnerSet=%d lookup\n",
-           id.U, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag, io.directory.bits.scBit, io.directory.bits.partnerSet)
+    printf("[InclusiveCache][SSBC MSHR %d] PRIMARY_MISS origSet=%d origWay=%d origTag=0x%x displaced=%d scBit=%d -> partnerSet=%d lookup\n",
+           id.U, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag, io.directory.bits.displaced, io.directory.bits.scBit, io.directory.bits.partnerSet)
   }
   when (dir_valid && !ssbcNeedPartner && !ssbcWaitPartner && ssbcEnabled && !io.directory.bits.hit && !io.directory.bits.scBit) {
-    printf("[InclusiveCache][SSBC MSHR %d] PRIMARY_MISS origSet=%d origWay=%d origTag=0x%x scBit=%d (no secondary search)\n",
-           id.U, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag, io.directory.bits.scBit)
+    printf("[InclusiveCache][SSBC MSHR %d] PRIMARY_MISS origSet=%d origWay=%d origTag=0x%x displaced=%d scBit=%d (no secondary search)\n",
+           id.U, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag, io.directory.bits.displaced, io.directory.bits.scBit)
   }
 
   when (dir_valid && !ssbcNeedPartner && !ssbcWaitPartner && ssbcEnabled && io.directory.bits.hit) {
@@ -262,6 +267,11 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   when (ssbcNeedPartner && io.partnerReadGrant) {
     ssbcNeedPartner := false.B
     ssbcWaitPartner := true.B
+  }
+  // DEBUG: print when ssbcNeedPartner is asserted but partnerReadGrant hasn't fired
+  when (ssbcNeedPartner && !io.partnerReadGrant) {
+    printf("[InclusiveCache][SSBC MSHR %d] PARTNER_READ_WAIT partnerRead.valid=%d partnerReadGrant=%d set=%d tag=0x%x\n",
+           id.U, io.partnerRead.valid, io.partnerReadGrant, request.set, request.tag)
   }
 
   val secondary_hit = ssbcWaitPartner && dir_valid &&
@@ -281,8 +291,8 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
       printf("[InclusiveCache][SSBC MSHR %d] SECONDARY_HIT origSet=%d partnerSet=%d partnerWay=%d partnerTag=0x%x\n",
              id.U, ssbcPrimary.set, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag)
     } .otherwise {
-      printf("[InclusiveCache][SSBC MSHR %d] SECONDARY_MISS origSet=%d partnerSet=%d partnerWay=%d partnerTag=0x%x\n",
-             id.U, ssbcPrimary.set, io.directory.bits.set, io.directory.bits.way, io.directory.bits.tag)
+      printf("[InclusiveCache][SSBC MSHR %d] SECONDARY_MISS origSet=%d partnerSet=%d partnerWay=%d partnerLineDisplaced=%d partnerTag=0x%x\n",
+             id.U, ssbcPrimary.set, io.directory.bits.set, io.directory.bits.way, io.directory.bits.displaced, io.directory.bits.tag)
     }
   }
 
@@ -295,9 +305,15 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   }
 
   // SSBC displacement decision (controller-side)
+  // Bug #3 fix: never re-migrate a displaced line. A displaced line is already sitting in its
+  // partner set from a prior migration; sending it back to originSet creates ping-pong and
+  // deadlocks when originSet's MSHR slot is busy. Displaced victims must take the normal
+  // s_release → DRAM eviction path.
   val shouldMigrate = ssbcEnabled && !dir_final.hit && (dir_final.state =/= INVALID) &&
-                      (dir_final.currentSat >= ssbcSatMax) &&
-                      (dir_final.partnerSat < ssbcSatLow)
+                      (dir_final.currentSat >= dir_final.partnerSat) &&
+                      !dir_final.displaced
+                      // (dir_final.currentSat >= ssbcSatMax) &&
+                      // (dir_final.partnerSat < ssbcSatLow)
   // Migration datapath (actual line move + dual-directory update) is not complete yet.
   // Keep decision visibility, but execute normal eviction until datapath support is added.
   val migrationPathReady = true.B
@@ -343,17 +359,27 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
     w_rprobeackfirst := true.B
     w_rprobeacklast := true.B
     w_releaseack := true.B
+    // FIX: clear s_dir_evict so the s_acquire guard (s_release && s_pprobe && s_migrate && s_dir_evict)
+    // can be satisfied. The partner victim's dirty writeback was already handled by this eviction's
+    // own w_releaseack; leaving s_dir_evict=false here permanently blocks s_acquire (deadlock).
+    s_dir_evict := true.B
     printf("[InclusiveCache][SSBC MSHR %d] PARTNER_EVICT_DONE partnerSet=%d partnerWay=%d partnerTag=0x%x\n",
            id.U, migrate_partnerSet, migrate_partnerWay, migrate_partnerVictimTag)
   }
   // Acquire is only legal once migration (if any) has actually completed.
-  io.schedule.bits.a.valid := !s_acquire && s_release && s_pprobe && s_migrate && w_migrate_done
+  // Also blocked until s_dir_evict: for dirty evictions we must not issue the outer Acquire
+  // before the directory slot has been cleared (which itself waits for w_releaseack).
+  io.schedule.bits.a.valid := !s_acquire && s_release && s_pprobe && s_migrate && w_migrate_done && s_dir_evict
   io.schedule.bits.b.valid := !s_rprobe || !s_pprobe
   io.schedule.bits.c.valid := (!s_release && w_rprobeackfirst && !request.control.invalidate && (!migrate_valid || migrate_evict_partner)) || (!s_probeack && w_pprobeackfirst)
   io.schedule.bits.d.valid := !s_execute && w_pprobeack && w_grant
   io.schedule.bits.e.valid := !s_grantack && w_grantfirst
   io.schedule.bits.x.valid := (!s_flush && w_releaseack && !request.control.invalidate) || (!s_flush && w_rprobeackfirst && request.control.invalidate)
-  io.schedule.bits.dir.valid := (!s_release && w_rprobeackfirst && (!migrate_valid || migrate_evict_partner)) || (!s_writeback && no_wait)
+  // For dirty evictions the DIR INVALID write is deferred until w_releaseack so that
+  // a directory slot is not visible as free while the dirty Release is still in flight.
+  // Clean evictions (w_releaseack already true at scheduling time) are unaffected.
+  val dirEvictReady = w_rprobeackfirst && w_releaseack && (!migrate_valid || migrate_evict_partner)
+  io.schedule.bits.dir.valid := (!s_release && dirEvictReady) || (!s_dir_evict && w_releaseack && s_release) || (!s_writeback && no_wait)
   io.schedule.bits.reload := no_wait
   
   // Migration schedule - when we have migration info and normal release is done
@@ -371,10 +397,18 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   io.schedule.bits.migrate.bits.dstVictimDirty := migrate_partnerVictimDirty
   io.schedule.bits.migrate.bits.dstVictimValid := migrate_partnerVictimValid
   
-  // Partner lookup request - request partner set info when migration is needed
-  io.partnerLookup.valid := !s_migrate_lookup && meta_valid && migrate_valid
+  // Partner lookup request - request partner set info when migration is needed.
+  // Guard with !w_migrate_lookup so we don't re-issue after the result has arrived.
+  io.partnerLookup.valid := !s_migrate_lookup && !w_migrate_lookup && meta_valid && migrate_valid
   io.partnerLookup.bits.set := meta.partnerSet
-  
+
+  // DEBUG: print state when MSHR has migration but partnerLookup isn't firing
+  when (request_valid && migrate_valid && !w_migrate_done) {
+    printf("[InclusiveCache][SSBC MSHR %d] MIGRATE_STATE s_ml=%d w_ml=%d meta_v=%d s_m=%d w_md=%d evict_p=%d s_acq=%d s_dir=%d s_rel=%d w_relack=%d\n",
+           id.U, s_migrate_lookup, w_migrate_lookup, meta_valid,
+           s_migrate, w_migrate_done, migrate_evict_partner, s_acquire, s_dir_evict, s_release, w_releaseack)
+  }
+
   io.schedule.valid := io.schedule.bits.a.valid || io.schedule.bits.b.valid || io.schedule.bits.c.valid ||
                        io.schedule.bits.d.valid || io.schedule.bits.e.valid || io.schedule.bits.x.valid ||
                        io.schedule.bits.dir.valid || io.schedule.bits.migrate.valid
@@ -387,16 +421,21 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
     // For migration (without partner-victim release), advance to partner lookup stage.
     when (w_rprobeackfirst && migrate_valid && !migrate_evict_partner)   { s_migrate_lookup := true.B }
                                                             s_pprobe     := true.B
-    when (s_release && s_pprobe && s_migrate)             { s_acquire    := true.B }
+    when (s_release && s_pprobe && s_migrate && s_dir_evict) { s_acquire  := true.B }
     when (w_releaseack && !request.control.invalidate)    { s_flush      := true.B }
     when (w_rprobeackfirst && request.control.invalidate) { s_flush      := true.B } // Invalidate only requires probe ack back
     when (w_pprobeackfirst)                               { s_probeack   := true.B }
     when (w_grantfirst)                                   { s_grantack   := true.B }
     when (w_pprobeack && w_grant)                         { s_execute    := true.B }
     when (no_wait)                                        { s_writeback  := true.B }
-    when (io.schedule.bits.migrate.valid)                 { s_migrate    := true.B }
+    // Guard with !no_wait: on the writeback (completion) cycle, migrate_valid is still true
+    // (cleared later in the same when-block) so migrate.valid can spuriously fire and
+    // pre-pollute s_migrate/w_migrate_done for the next incoming allocation.
+    when (io.schedule.bits.migrate.valid && !no_wait)     { s_migrate    := true.B }
     // Keep waiting until scheduler reports migration copy+directory updates completed.
-    when (io.schedule.bits.migrate.valid)                 { w_migrate_done := false.B }
+    when (io.schedule.bits.migrate.valid && !no_wait)     { w_migrate_done := false.B }
+    // Once the deferred DIR INVALID write fires (after w_releaseack), the slot is free.
+    when (!s_dir_evict && w_releaseack && s_release)      { s_dir_evict  := true.B }
     // Await the next operation
     when (no_wait) {
       request_valid := false.B
@@ -422,17 +461,24 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
     migrate_partnerVictimDirty := io.partnerResult.bits.victimDirty
     migrate_partnerVictimValid := io.partnerResult.bits.victimValid
     migrate_partnerVictimClients := io.partnerResult.bits.victimClients
+    migrate_partnerDisplaced := io.partnerResult.bits.victimDisplacedBit
+    // val victimDisplacedBit = Bool()
+    // val victimOriginSet = UInt(params.setBits.W)
+    migrate_partnerVictimOriginSet := io.partnerResult.bits.victimOriginSet
     migrate_partnerVictimState := io.partnerResult.bits.victimState
-    printf("[InclusiveCache][SSBC MSHR %d] PARTNER_LOOKUP partnerSet=%d partnerWay=%d partnerTag=0x%x dirty=%d valid=%d\n",
+    printf("[InclusiveCache][SSBC MSHR %d] PARTNER_LOOKUP partnerSet=%d partnerWay=%d partnerTag=0x%x [isDisplacedLine=%d from Set=%d] dirty=%d valid=%d\n",
            id.U, migrate_partnerSet, io.partnerResult.bits.way, io.partnerResult.bits.victimTag,
-           io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimValid)
+           io.partnerResult.bits.victimDisplacedBit, io.partnerResult.bits.victimOriginSet, io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimValid)
 
     // Step 1: handle partner victim eviction before migration
     when (io.partnerResult.bits.victimValid) {
       migrate_evict_partner := true.B
-      printf("[InclusiveCache][SSBC MSHR %d] PARTNER_EVICT_START partnerSet=%d partnerWay=%d partnerTag=0x%x dirty=%d clients=0x%x state=%d\n",
-             id.U, migrate_partnerSet, migrate_partnerWay, io.partnerResult.bits.victimTag,
-             io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimClients,
+      // Use io.partnerResult.bits.way (the just-arrived victim way) not the stale register.
+      // migrate_partnerWay := ... fires in this same when-block, so reading the Reg here
+      // would still see the old value (destination slot from MIGRATE_TRIGGER).
+      printf("[InclusiveCache][SSBC MSHR %d] PARTNER_EVICT_START partnerSet=%d partnerWay=%d partnerTag=0x%x [isDisplacedLine=%d from Set=%d] dirty=%d clients=0x%x state=%d\n",
+             id.U, migrate_partnerSet, io.partnerResult.bits.way, io.partnerResult.bits.victimTag,
+             io.partnerResult.bits.victimDisplacedBit, io.partnerResult.bits.victimOriginSet, io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimClients,
              io.partnerResult.bits.victimState)
       // Schedule release if dirty; otherwise skip release ack wait
       s_release := false.B
@@ -460,12 +506,25 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   val req_promoteT = req_acquire && Mux(meta.hit, meta_no_clients && meta.state === TIP, gotT)
 
   // Eviction metadata (normal vs partner victim)
-  val evictSet = Mux(migrate_evict_partner, migrate_partnerSet, request.set)
-  val evictTag = Mux(migrate_evict_partner, migrate_partnerVictimTag, meta.tag)
-  val evictWay = Mux(migrate_evict_partner, migrate_partnerWay, meta.way)
-  val evictDirty = Mux(migrate_evict_partner, migrate_partnerVictimDirty, meta.dirty)
-  val evictState = Mux(migrate_evict_partner, migrate_partnerVictimState, meta.state)
-  val evictClients = Mux(migrate_evict_partner, migrate_partnerVictimClients, meta.clients)
+  // For normal eviction, use the logical meta.set (not request.set) so displaced-line
+  // evictions probe/release against the correct logical address.
+  val evictPhysSet  = Mux(migrate_evict_partner, migrate_partnerSet,  meta.set)
+  val evictTag      = Mux(migrate_evict_partner, migrate_partnerVictimTag,      meta.tag)
+  val evictWay      = Mux(migrate_evict_partner, migrate_partnerWay,            meta.way)
+  val evictDirty    = Mux(migrate_evict_partner, migrate_partnerVictimDirty,    meta.dirty)
+  val evictState    = Mux(migrate_evict_partner, migrate_partnerVictimState,     meta.state)
+  val evictClients  = Mux(migrate_evict_partner, migrate_partnerVictimClients,  meta.clients)
+  // The logical (address) set for probes/releases: if the evicted line is displaced,
+  // its logical owner is meta.originSet, not the physical cache set.
+  // val evictSet      = Mux(migrate_evict_partner, migrate_partnerSet,
+  //                       Mux(meta.displaced,       meta.originSet,    meta.set))
+  val evictSet = Mux(migrate_evict_partner,
+                 Mux(migrate_partnerDisplaced,
+                     migrate_partnerVictimOriginSet,  // displaced partner victim → use its logical home
+                     migrate_partnerSet),             // non-displaced → physSet == logicalSet
+                 Mux(meta.displaced,
+                     meta.originSet,                  // displaced self-victim (already correct)
+                     meta.set))
 
   when (request.prio(2) && (!params.firstLevel).B) { // always a hit
     final_meta_writeback.dirty   := meta.dirty || request.opcode(0)
@@ -551,7 +610,8 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   io.schedule.bits.c.bits.param   := Mux(evictState === BRANCH, BtoN, TtoN)
   io.schedule.bits.c.bits.source  := 0.U
   io.schedule.bits.c.bits.tag     := evictTag
-  io.schedule.bits.c.bits.set     := evictSet
+  io.schedule.bits.c.bits.set     := evictSet     // logical set for TileLink address
+  io.schedule.bits.c.bits.physSet := evictPhysSet // physical set for BankedStore SRAM read
   io.schedule.bits.c.bits.way     := evictWay
   io.schedule.bits.c.bits.dirty   := evictDirty
   io.schedule.bits.d.bits.viewAsSupertype(chiselTypeOf(request)) := request
@@ -566,9 +626,14 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   io.schedule.bits.d.bits.bad     := bad_grant
   io.schedule.bits.e.bits.sink    := sink
   io.schedule.bits.x.bits.fail    := false.B
-  io.schedule.bits.dir.bits.set   := Mux(migrate_evict_partner, migrate_partnerSet, meta.set)
+  io.schedule.bits.dir.bits.set   := evictPhysSet  // physical set: partner set or meta.set
   io.schedule.bits.dir.bits.way   := evictWay
-  io.schedule.bits.dir.bits.data  := Mux(!s_release, invalid, WireInit(new DirectoryEntry(params), init = final_meta_writeback))
+  // dir.bits.data selection:
+  //   !s_release (evict DIR write)    → invalid  (clearing the old occupant)
+  //   !s_dir_evict (deferred evict)   → invalid  (dirty eviction slot cleared after ReleaseAck)
+  //   !s_writeback (writeback phase)  → final_meta_writeback  (installing the new line)
+  val dirWriteIsEvict = !s_release || (!s_dir_evict && w_releaseack && s_release)
+  io.schedule.bits.dir.bits.data  := Mux(dirWriteIsEvict, invalid, WireInit(new DirectoryEntry(params), init = final_meta_writeback))
 
   // Coverage of state transitions
   def cacheState(entry: DirectoryEntry, hit: Bool) = {
@@ -824,6 +889,7 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
     s_pprobe         := true.B
     s_acquire        := true.B
     s_flush          := true.B
+    s_dir_evict      := true.B  // no pending deferred dir-evict write
     w_grantfirst     := true.B
     w_grantlast      := true.B
     w_grant          := true.B
@@ -856,6 +922,12 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
       printf("[InclusiveCache][SSBC MSHR %d] MIGRATE_TRIGGER srcSet=%d srcTag=0x%x -> partnerSet=%d partnerWay=%d\n",
              id.U, dir_final.set, dir_final.tag, 
              dir_final.partnerSet, dir_final.partnerWay)
+    }
+    // DEBUG: show what doMigrate evaluated to when dir_final_valid fires
+    when (dir_final_valid) {
+      printf("[InclusiveCache][SSBC MSHR %d] DIR_FINAL_VALID hit=%d state=%d doMigrate=%d shouldMigrate=%d s_migrate_out=%d currentSat=%d partnerSat=%d\n",
+             id.U, dir_final.hit, dir_final.state, doMigrate, shouldMigrate, s_migrate,
+             dir_final.currentSat, dir_final.partnerSat)
     }
 
     // For C channel requests (ie: Release[Data])
@@ -909,6 +981,10 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
           // Normal eviction path: release to memory
           s_release := false.B
           w_releaseack := false.B
+          // For dirty lines the DIR INVALID write must wait for w_releaseack.
+          // For clean lines w_releaseack starts true so s_dir_evict can stay true
+          // (the dir write fires immediately as before with no behaviour change).
+          when (new_meta.dirty) { s_dir_evict := false.B }
         }
         // Do we need to shoot-down inner caches?
         when ((!params.firstLevel).B & (new_meta.clients =/= 0.U)) {

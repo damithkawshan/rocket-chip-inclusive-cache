@@ -27,7 +27,8 @@ class SourceCRequest(params: InclusiveCacheParameters) extends InclusiveCacheBun
   val param  = UInt(3.W)
   val source = UInt(params.outer.bundle.sourceBits.W)
   val tag    = UInt(params.tagBits.W)
-  val set    = UInt(params.setBits.W)
+  val set    = UInt(params.setBits.W)   // logical set — used for TileLink address
+  val physSet = UInt(params.setBits.W)   // physical BankedStore set — used for SRAM read
   val way    = UInt(params.wayBits.W)
   val dirty  = Bool()
 }
@@ -71,13 +72,13 @@ class SourceC(params: InclusiveCacheParameters) extends Module
 
   io.req.ready := !busy && room
 
-  io.evict_req.set := req.set
+  io.evict_req.set := req.physSet  // hazard check uses physical set
   io.evict_req.way := req.way
 
   io.bs_adr.valid := (beat.orR || io.evict_safe) && want_data
   io.bs_adr.bits.noop := false.B
   io.bs_adr.bits.way  := req.way
-  io.bs_adr.bits.set  := req.set
+  io.bs_adr.bits.set  := req.physSet // MUST use physical set for SRAM read (displaced lines)
   io.bs_adr.bits.beat := beat
   io.bs_adr.bits.mask := ~0.U(params.outerMaskBits.W)
 

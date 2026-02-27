@@ -91,6 +91,8 @@ class PartnerLookupResult(params: InclusiveCacheParameters) extends InclusiveCac
   val way = UInt(params.wayBits.W)
   val victimTag = UInt(params.tagBits.W)
   val victimDirty = Bool()
+  val victimDisplacedBit = Bool()
+  val victimOriginSet = UInt(params.setBits.W)
   val victimValid = Bool()
   val victimClients = UInt(params.clientBits.W)
   val victimState = UInt(params.stateBits.W)
@@ -308,6 +310,8 @@ class Directory(params: InclusiveCacheParameters) extends Module
   io.partnerResult.bits.victimDirty := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.dirty, partnerVictimEntry.dirty)
   io.partnerResult.bits.victimValid := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.state =/= INVALID, partnerVictimEntry.state =/= INVALID)
   io.partnerResult.bits.victimClients := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.clients, partnerVictimEntry.clients)
+  io.partnerResult.bits.victimDisplacedBit := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.displaced, partnerVictimEntry.displaced)
+  io.partnerResult.bits.victimOriginSet := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.originSet, partnerVictimEntry.originSet)
   io.partnerResult.bits.victimState := Mux(partnerSetQuash && partnerWayMatch, partnerBypass.data.state, partnerVictimEntry.state)
   
   // Update saturation counters from controller after final hit/miss

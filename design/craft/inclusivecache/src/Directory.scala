@@ -228,12 +228,11 @@ class Directory(params: InclusiveCacheParameters) extends Module
   val finalVictimWay   = OHToUInt(finalVictimWayOH)
   val wayMatch         = bypass.way === finalVictimWay
   val hits = Cat(ways.zipWithIndex.map { case (w, i) =>
-    w.tag === tag && w.state =/= INVALID && (!setQuash || i.U =/= bypass.way)
+    w.tag === tag && w.state =/= INVALID && !w.displaced && (!setQuash || i.U =/= bypass.way)
   }.reverse)
   val hit = hits.orR
-  // Use original hit logic for functional behavior (match upstream);
-  // bypassed same-cycle writes are not treated as hits here.
-  val primaryHit = hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
+  val bypassHit = setQuash && tagMatch && bypass.data.state =/= INVALID && !bypass.data.displaced
+  val primaryHit = hit || bypassHit
   val primaryMiss = !primaryHit
   
   // Calculate partner set by inverting MSB
@@ -250,10 +249,10 @@ class Directory(params: InclusiveCacheParameters) extends Module
   //   2) Current set is at maximum saturation (counter == 2K-1)
   //   3) Partner set is underutilized (counter < K)
   //   4) The victim way has valid data to migrate
-  val hitEntry = Mux(setQuash && tagMatch, bypass.data, Mux1H(hits, ways))
+  val hitEntry = Mux(bypassHit, bypass.data, Mux1H(hits, ways))
   val victimEntry = Mux(setQuash && (tagMatch || wayMatch), bypass.data, Mux1H(finalVictimWayOH, ways))
   val victimValid = victimEntry.state =/= INVALID  // Victim must be valid to migrate
-  val resultEntry = Mux(hit, hitEntry, victimEntry)
+  val resultEntry = Mux(primaryHit, hitEntry, victimEntry)
 
   // SSBC: Log when we fall back to evicting a displaced line (all ways are displaced).
   when (ren2 && primaryMiss && victimEntry.displaced) {
@@ -264,8 +263,8 @@ class Directory(params: InclusiveCacheParameters) extends Module
 
   io.result.valid := ren2
   io.result.bits.viewAsSupertype(chiselTypeOf(bypass.data)) := resultEntry
-  io.result.bits.hit := hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
-  io.result.bits.way := Mux(hit, OHToUInt(hits), Mux(setQuash && tagMatch, bypass.way, finalVictimWay))
+  io.result.bits.hit := primaryHit
+  io.result.bits.way := Mux(hit, OHToUInt(hits), Mux(bypassHit, bypass.way, finalVictimWay))
   io.result.bits.set := set
   io.result.bits.scBit := secondSearchBits(set)
   io.result.bits.partnerScBit := secondSearchBits(partnerSet)

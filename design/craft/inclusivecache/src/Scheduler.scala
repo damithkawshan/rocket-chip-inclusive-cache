@@ -115,8 +115,14 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   val migrationDonePulse = WireDefault(false.B)
 
   // Deliver messages from Sinks to MSHRs
+  val sinkCOwnerOH = Cat(mshrs.map { m =>
+    m.io.status.valid &&
+    sinkC.io.resp.bits.set === m.io.status.bits.set &&
+    sinkC.io.resp.bits.tag === m.io.status.bits.tag
+  }.reverse)
+
   mshrs.zipWithIndex.foreach { case (m, i) =>
-    m.io.sinkc.valid := sinkC.io.resp.valid && sinkC.io.resp.bits.set === m.io.status.bits.physSet
+    m.io.sinkc.valid := sinkC.io.resp.valid && sinkCOwnerOH(i)
     m.io.sinkd.valid := sinkD.io.resp.valid && sinkD.io.resp.bits.source === i.U
     m.io.sinke.valid := sinkE.io.resp.valid && sinkE.io.resp.bits.sink   === i.U
     m.io.sinkc.bits := sinkC.io.resp.bits
@@ -131,13 +137,69 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
     // Default: migration not completed this cycle
     m.io.migrateDone := false.B
   }
+
+  // val sinkcPhysMatchOH = Cat(mshrs.map { m =>
+  //   m.io.status.valid && sinkC.io.resp.bits.set === m.io.status.bits.physSet
+  // }.reverse)
+  // val sinkcLogicalMatchOH = Cat(mshrs.map { m =>
+  //   m.io.status.valid && sinkC.io.resp.bits.set === m.io.status.bits.set
+  // }.reverse)
+  // val sinkcPhysMatchCount = PopCount(sinkcPhysMatchOH)
+  // val sinkcLogicalOnlyOH = sinkcLogicalMatchOH & ~sinkcPhysMatchOH
+
+  // when (sinkC.io.resp.valid && (sinkcPhysMatchCount =/= 1.U || sinkcLogicalOnlyOH.orR)) {
+  //   printf("[InclusiveCache][DBG Scheduler] sinkC owner issue set=%d tag=0x%x source=%d param=%d data=%d last=%d " +
+  //          "physOH=0x%x logicalOH=0x%x\n",
+  //          sinkC.io.resp.bits.set, sinkC.io.resp.bits.tag, sinkC.io.resp.bits.source,
+  //          sinkC.io.resp.bits.param, sinkC.io.resp.bits.data, sinkC.io.resp.bits.last,
+  //          sinkcPhysMatchOH, sinkcLogicalMatchOH)
+  //   mshrs.zipWithIndex.foreach { case (m, i) =>
+  //     when (m.io.status.valid) {
+  //       val physMatch = sinkC.io.resp.bits.set === m.io.status.bits.physSet
+  //       val logicalMatch = sinkC.io.resp.bits.set === m.io.status.bits.set
+  //       printf("[InclusiveCache][DBG Scheduler]   mshr=%d set=%d physSet=%d tag=0x%x way=%d " +
+  //              "physMatch=%d logicalMatch=%d blockB=%d nestB=%d blockC=%d nestC=%d\n",
+  //              i.U, m.io.status.bits.set, m.io.status.bits.physSet, m.io.status.bits.tag,
+  //              m.io.status.bits.way, physMatch, logicalMatch, m.io.status.bits.blockB,
+  //              m.io.status.bits.nestB, m.io.status.bits.blockC, m.io.status.bits.nestC)
+  //     }
+  //   }
+  // }
   
-  // Partner lookup arbitration - only one MSHR can use partner lookup at a time
+  // Workaround: before allowing migration partner-lookup, check that the proposed partnerSet
+  // (flip of the top bit of the requesting MSHR's logical set) is not already in use by
+  // another active MSHR as its physSet.  If it is, suppress the lookup for this cycle so
+  // the migration does not proceed into a partner-victim eviction that physSet-conflicts
+  // with the other MSHR, which would cause both MSHRs to stall on each other indefinitely.
+  //
+  // Damith : Possible Future Performance Improvement
+  // This is a conservative gate: it delays migration whenever the target partnerSet is busy,
+  // even if the conflict would not actually deadlock (e.g. the other MSHR is in a phase that
+  // does not hold the physSet lock).  A more precise check would inspect the other MSHR's
+  // FSM phase, but that requires exposing internal state through the io.status bundle.
   val partnerLookupReqs = mshrs.map(_.io.partnerLookup.valid)
   val partnerLookupGrant = PriorityEncoderOH(partnerLookupReqs)
-  directory.io.partnerLookup.valid := !migrationBusy && partnerLookupReqs.reduce(_ || _)
-  directory.io.partnerLookup.bits := Mux1H(partnerLookupGrant, mshrs.map(_.io.partnerLookup.bits))
-  
+  // For each MSHR i that is requesting a partner lookup, compute whether any *other* MSHR j
+  // already has its physSet equal to MSHR i's proposed partnerSet.
+  // The partner set of a logical set s is defined as: Cat(~s(setBits-1), s(setBits-2, 0))
+  // i.e. flip the top bit.  We re-derive it here from the requesting MSHR's logical set.
+  val partnerLookupBlocked = mshrs.map { mi =>
+    val proposedPartnerSet = Cat(~mi.io.status.bits.set(params.setBits - 1),
+                                  mi.io.status.bits.set(params.setBits - 2, 0))
+    // Use Scala-level filtering (eq/ne are Scala identity comparisons, not hardware)
+    // to enumerate only the *other* MSHRs, then OR together their hardware conflict signals.
+    val otherMshrs = mshrs.filterNot(_ eq mi)
+    val conflictWithOther = otherMshrs.map { mj =>
+      mj.io.status.valid && (mj.io.status.bits.physSet === proposedPartnerSet)
+    }.reduce(_ || _)
+    mi.io.partnerLookup.valid && conflictWithOther
+  }
+  val partnerLookupReqsGated = (partnerLookupReqs zip partnerLookupBlocked).map {
+    case (req, blocked) => req && !blocked
+  }
+  directory.io.partnerLookup.valid := !migrationBusy && partnerLookupReqsGated.reduce(_ || _)
+  directory.io.partnerLookup.bits  := Mux1H(partnerLookupGrant, mshrs.map(_.io.partnerLookup.bits))
+
   // Route partner result back to the requesting MSHR
   mshrs.zipWithIndex.foreach { case (m, i) =>
     when (partnerLookupGrant(i) && directory.io.partnerResult.valid) {
@@ -253,6 +315,10 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   // If a same-set MSHR says that requests of this type must be blocked (for bounded time), do it
   val blockB = Mux1H(setMatches, mshrs.map(_.io.status.bits.blockB)) && request.bits.prio(1)
   val blockC = Mux1H(setMatches, mshrs.map(_.io.status.bits.blockC)) && request.bits.prio(2)
+  // Bug #7: block channel-A requests that match an MSHR's temporary physSet (partner set)
+  // during SSBC migration. Without this, the request gets queued and its set field is
+  // overwritten with the wrong logical set, causing corrupted data.
+  val blockA = Mux1H(setMatches, mshrs.map(_.io.status.bits.blockA)) && request.bits.prio(0)
   // If a same-set MSHR says that requests of this type must be handled out-of-band, use special BC|C MSHR
   // ... these special MSHRs interlock the MSHR that said it should be pre-empted.
   val nestB  = Mux1H(setMatches, mshrs.map(_.io.status.bits.nestB))  && request.bits.prio(1)
@@ -261,7 +327,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   val prioFilter = Cat(request.bits.prio(2), !request.bits.prio(0), ~0.U((params.mshrs-2).W))
   val lowerMatches = setMatches & prioFilter
   // If we match an MSHR <= our priority that neither blocks nor nests us, queue to it.
-  val queue = lowerMatches.orR && !nestB && !nestC && !blockB && !blockC
+  val queue = lowerMatches.orR && !nestB && !nestC && !blockB && !blockC && !blockA
 
   if (!params.lastLevel) {
     params.ccover(request.valid && blockB, "SCHEDULER_BLOCKB", "Interlock B request while resolving set conflict")
@@ -334,10 +400,10 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   // Fanout the request to the appropriate handler (if any)
   val bypassQueue = schedule.reload && bypassMatches
   val request_alloc_cases = !migrationBusy && !partnerReadFire && (
-     (alloc && !mshr_uses_directory_assuming_no_bypass && mshr_free) ||
+     (alloc && !blockA && !mshr_uses_directory_assuming_no_bypass && mshr_free) ||
      (nestB && !mshr_uses_directory_assuming_no_bypass && !bc_mshr.io.status.valid && !c_mshr.io.status.valid) ||
      (nestC && !mshr_uses_directory_assuming_no_bypass && !c_mshr.io.status.valid))
-  request.ready := !migrationBusy && !partnerReadFire && (request_alloc_cases || (queue && (bypassQueue || requests.io.push.ready)))
+  request.ready := !migrationBusy && !partnerReadFire && !blockA && (request_alloc_cases || (queue && (bypassQueue || requests.io.push.ready)))
   val alloc_uses_directory = !migrationBusy && !partnerReadFire && request.valid && request_alloc_cases
 
   // When a request goes through, it will need to hit the Directory
@@ -348,6 +414,9 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   directory.io.read.bits.tag :=
     Mux(partnerReadFire, partnerReadBits.tag,
       Mux(mshr_uses_directory_for_lb, requests.io.data.tag, request.bits.tag))
+  directory.io.read.bits.logicalSet :=
+    Mux(partnerReadFire, partnerReadBits.logicalSet,
+      Mux(mshr_uses_directory_for_lb, scheduleSet, request.bits.set))
   directory.io.read.bits.source :=
     Mux(partnerReadFire, partnerReadBits.source,
       Mux(mshr_uses_directory_for_lb, requests.io.data.source, request.bits.source))
@@ -363,14 +432,14 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
 
   val mshr_insertOH = ~(leftOR(~mshr_validOH) << 1) & ~mshr_validOH & prioFilter
   (mshr_insertOH.asBools zip mshrs) map { case (s, m) =>
-    when (request.valid && alloc && s && !mshr_uses_directory_assuming_no_bypass) {
+    when (request.fire && alloc && s && !mshr_uses_directory_assuming_no_bypass) {
       m.io.allocate.valid := true.B
       m.io.allocate.bits.viewAsSupertype(chiselTypeOf(request.bits)) := request.bits
       m.io.allocate.bits.repeat := false.B
     }
   }
 
-  when (request.valid && nestB && !bc_mshr.io.status.valid && !c_mshr.io.status.valid && !mshr_uses_directory_assuming_no_bypass) {
+  when (request.fire && nestB && !bc_mshr.io.status.valid && !c_mshr.io.status.valid && !mshr_uses_directory_assuming_no_bypass) {
     bc_mshr.io.allocate.valid := true.B
     bc_mshr.io.allocate.bits.viewAsSupertype(chiselTypeOf(request.bits)) := request.bits
     bc_mshr.io.allocate.bits.repeat := false.B
@@ -378,7 +447,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   }
   bc_mshr.io.allocate.bits.prio(0) := false.B
 
-  when (request.valid && nestC && !c_mshr.io.status.valid && !mshr_uses_directory_assuming_no_bypass) {
+  when (request.fire && nestC && !c_mshr.io.status.valid && !mshr_uses_directory_assuming_no_bypass) {
     c_mshr.io.allocate.valid := true.B
     c_mshr.io.allocate.bits.viewAsSupertype(chiselTypeOf(request.bits)) := request.bits
     c_mshr.io.allocate.bits.repeat := false.B
@@ -406,11 +475,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   directory.io.satUpdate.bits := Mux1H(satUpdateOH, mshrs.map(_.io.satUpdate.bits))
 
   // MSHR response meta-data fetch
-  sinkC.io.way :=
-    Mux(bc_mshr.io.status.valid && bc_mshr.io.status.bits.physSet === sinkC.io.set,
-      bc_mshr.io.status.bits.way,
-      Mux1H(abc_mshrs.map(m => m.io.status.valid && m.io.status.bits.physSet === sinkC.io.set),
-            abc_mshrs.map(_.io.status.bits.way)))
+  sinkC.io.way := Mux1H(sinkCOwnerOH, mshrs.map(_.io.status.bits.way))
   sinkD.io.way := VecInit(mshrs.map(_.io.status.bits.way))(sinkD.io.source)
   sinkD.io.set := VecInit(mshrs.map(_.io.status.bits.set))(sinkD.io.source)
 

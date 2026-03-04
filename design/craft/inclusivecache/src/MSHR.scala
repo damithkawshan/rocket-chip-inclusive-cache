@@ -68,6 +68,7 @@ class MSHRStatus(params: InclusiveCacheParameters) extends InclusiveCacheBundle(
   val nestB  = Bool()
   val blockC = Bool()
   val nestC  = Bool()
+  val blockA = Bool()  // Bug #7: block channel-A requests when physSet != set (SSBC migration)
 }
 
 class NestedWriteback(params: InclusiveCacheParameters) extends InclusiveCacheBundle(params)
@@ -145,6 +146,7 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   io.partnerRead.valid := ssbcNeedPartner
   io.partnerRead.bits.set := partnerSetOf(request.set)
   io.partnerRead.bits.tag := request.tag
+  io.partnerRead.bits.logicalSet := request.set  // logical home is always the original request set
   io.partnerRead.bits.source := request.source
   io.satUpdate.valid := false.B
   io.satUpdate.bits.set := request.set
@@ -309,15 +311,16 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   // partner set from a prior migration; sending it back to originSet creates ping-pong and
   // deadlocks when originSet's MSHR slot is busy. Displaced victims must take the normal
   // s_release → DRAM eviction path.
-  val shouldMigrate = ssbcEnabled && !dir_final.hit && (dir_final.state =/= INVALID) &&
+  val shouldMigrate = ssbcEnabled && !dir_final.hit && (dir_final.state =/= INVALID) && (dir_final.currentSat > 0.U) &&
                       (dir_final.currentSat >= dir_final.partnerSat) &&
                       !dir_final.displaced
                       // (dir_final.currentSat >= ssbcSatMax) &&
                       // (dir_final.partnerSat < ssbcSatLow)
-  // Migration datapath (actual line move + dual-directory update) is not complete yet.
-  // Keep decision visibility, but execute normal eviction until datapath support is added.
-  val migrationPathReady = true.B
-  val doMigrate = shouldMigrate && migrationPathReady
+  // Cheap-only migration: only migrate when source has no inner-cache clients (no probe needed).
+  // Bug #6 fix: if the source line is held by an L1 (clients != 0) we would need to probe it
+  // before migration, which is too expensive and error-prone. Fall back to normal eviction.
+  val srcCheap  = (dir_final.clients === 0.U)
+  val doMigrate = shouldMigrate && srcCheap
 
   // When a nested transaction completes, update our meta data
   when (meta_valid && meta.state =/= INVALID &&
@@ -340,6 +343,10 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   // own inner probes. Thus every probe wakes exactly one MSHR.
   io.status.bits.blockC := !meta_valid
   io.status.bits.nestC  := meta_valid && (!w_rprobeackfirst || !w_pprobeackfirst || !w_grantfirst)
+  // Bug #7: block A-channel requests from matching this MSHR when physSet != set.
+  // During SSBC migration, physSet temporarily points to the partner set; queuing an
+  // A-channel request here would overwrite its set field with the wrong logical set.
+  io.status.bits.blockA := io.status.bits.physSet =/= io.status.bits.set
   // The w_grantfirst in nestC is necessary to deal with:
   //   acquire waiting for grant, inner release gets queued, outer probe -> inner probe -> deadlock
   // ... this is possible because the release+probe can be for same set, but different tag
@@ -403,11 +410,11 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   io.partnerLookup.bits.set := meta.partnerSet
 
   // DEBUG: print state when MSHR has migration but partnerLookup isn't firing
-  when (request_valid && migrate_valid && !w_migrate_done) {
-    printf("[InclusiveCache][SSBC MSHR %d] MIGRATE_STATE s_ml=%d w_ml=%d meta_v=%d s_m=%d w_md=%d evict_p=%d s_acq=%d s_dir=%d s_rel=%d w_relack=%d\n",
-           id.U, s_migrate_lookup, w_migrate_lookup, meta_valid,
-           s_migrate, w_migrate_done, migrate_evict_partner, s_acquire, s_dir_evict, s_release, w_releaseack)
-  }
+  // when (request_valid && migrate_valid && !w_migrate_done) {
+  //   printf("[InclusiveCache][SSBC MSHR %d] MIGRATE_STATE s_ml=%d w_ml=%d meta_v=%d s_m=%d w_md=%d evict_p=%d s_acq=%d s_dir=%d s_rel=%d w_relack=%d\n",
+  //          id.U, s_migrate_lookup, w_migrate_lookup, meta_valid,
+  //          s_migrate, w_migrate_done, migrate_evict_partner, s_acquire, s_dir_evict, s_release, w_releaseack)
+  // }
 
   io.schedule.valid := io.schedule.bits.a.valid || io.schedule.bits.b.valid || io.schedule.bits.c.valid ||
                        io.schedule.bits.d.valid || io.schedule.bits.e.valid || io.schedule.bits.x.valid ||
@@ -455,43 +462,71 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   
   // Handle partner lookup result
   when (io.partnerResult.valid && !w_migrate_lookup) {
-    w_migrate_lookup := true.B
-    migrate_partnerWay := io.partnerResult.bits.way //this is the way that we will migrate to, which is the victim way in the partner set
-    migrate_partnerVictimTag := io.partnerResult.bits.victimTag 
-    migrate_partnerVictimDirty := io.partnerResult.bits.victimDirty
-    migrate_partnerVictimValid := io.partnerResult.bits.victimValid
-    migrate_partnerVictimClients := io.partnerResult.bits.victimClients
-    migrate_partnerDisplaced := io.partnerResult.bits.victimDisplacedBit
-    // val victimDisplacedBit = Bool()
-    // val victimOriginSet = UInt(params.setBits.W)
+    // Always capture the partner lookup metadata into registers
+    migrate_partnerWay             := io.partnerResult.bits.way
+    migrate_partnerVictimTag       := io.partnerResult.bits.victimTag
+    migrate_partnerVictimDirty     := io.partnerResult.bits.victimDirty
+    migrate_partnerVictimValid     := io.partnerResult.bits.victimValid
+    migrate_partnerVictimClients   := io.partnerResult.bits.victimClients
+    migrate_partnerDisplaced       := io.partnerResult.bits.victimDisplacedBit
     migrate_partnerVictimOriginSet := io.partnerResult.bits.victimOriginSet
-    migrate_partnerVictimState := io.partnerResult.bits.victimState
+    migrate_partnerVictimState     := io.partnerResult.bits.victimState
     printf("[InclusiveCache][SSBC MSHR %d] PARTNER_LOOKUP partnerSet=%d partnerWay=%d partnerTag=0x%x [isDisplacedLine=%d from Set=%d] dirty=%d valid=%d\n",
            id.U, migrate_partnerSet, io.partnerResult.bits.way, io.partnerResult.bits.victimTag,
-           io.partnerResult.bits.victimDisplacedBit, io.partnerResult.bits.victimOriginSet, io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimValid)
+           io.partnerResult.bits.victimDisplacedBit, io.partnerResult.bits.victimOriginSet,
+           io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimValid)
 
-    // Step 1: handle partner victim eviction before migration
-    when (io.partnerResult.bits.victimValid) {
-      migrate_evict_partner := true.B
-      // Use io.partnerResult.bits.way (the just-arrived victim way) not the stale register.
-      // migrate_partnerWay := ... fires in this same when-block, so reading the Reg here
-      // would still see the old value (destination slot from MIGRATE_TRIGGER).
-      printf("[InclusiveCache][SSBC MSHR %d] PARTNER_EVICT_START partnerSet=%d partnerWay=%d partnerTag=0x%x [isDisplacedLine=%d from Set=%d] dirty=%d clients=0x%x state=%d\n",
-             id.U, migrate_partnerSet, io.partnerResult.bits.way, io.partnerResult.bits.victimTag,
-             io.partnerResult.bits.victimDisplacedBit, io.partnerResult.bits.victimOriginSet, io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimClients,
-             io.partnerResult.bits.victimState)
-      // Schedule release if dirty; otherwise skip release ack wait
-      s_release := false.B
-      w_releaseack := !io.partnerResult.bits.victimDirty
-      // Partner-victim probe requirements are independent from source-set probe state.
-      when ((!params.firstLevel).B && (io.partnerResult.bits.victimClients =/= 0.U)) {
-        s_rprobe := false.B
+    // Cheap-only gate: partner victim is cheap if the slot is empty OR has no L1 clients.
+    // Bug #6 fix: never migrate into a slot whose victim requires inner-cache probes.
+    val partnerCheap = (!io.partnerResult.bits.victimValid) ||
+                       (io.partnerResult.bits.victimClients === 0.U)
+    printf("[InclusiveCache][SSBC MSHR %d] PARTNER_CHEAP srcClients=0x%x partnerCheap=%d victimValid=%d victimClients=0x%x victimDirty=%d\n",
+           id.U, meta.clients, partnerCheap, io.partnerResult.bits.victimValid,
+           io.partnerResult.bits.victimClients, io.partnerResult.bits.victimDirty)
+
+    when (!partnerCheap) {
+      // CANCEL migration: reset all migration FSM state so we don't stall.
+      // Fall back to normal source-set eviction (the original victim before migration was chosen).
+      w_migrate_lookup   := true.B   // mark lookup done (so FSM doesn't wait forever)
+      migrate_valid      := false.B
+      migrate_evict_partner := false.B
+      s_migrate_lookup   := true.B
+      s_migrate          := true.B
+      w_migrate_done     := true.B
+      // Re-arm the normal eviction path for the source-set victim.
+      // (Migration path had set s_release/w_releaseack to true at allocation time;
+      //  we now revert to the non-migration eviction settings.)
+      s_release          := false.B
+      w_releaseack       := false.B
+      when (meta.dirty) { s_dir_evict := false.B }
+      // Re-check whether source victim needs inner-cache probes.
+      when ((!params.firstLevel).B && (meta.clients =/= 0.U)) {
+        s_rprobe         := false.B
         w_rprobeackfirst := false.B
-        w_rprobeacklast := false.B
-      } .otherwise {
-        s_rprobe := true.B
+        w_rprobeacklast  := false.B
+      }
+      printf("[InclusiveCache][SSBC MSHR %d] MIGRATE_CANCEL (partnerCheap=0) srcSet=%d srcWay=%d -> fallback normal evict\n",
+             id.U, request.set, meta.way)
+    } .otherwise {
+      // partnerCheap: proceed with migration
+      w_migrate_lookup := true.B
+
+      // Step 1: handle partner victim eviction before migration (only if slot occupied)
+      when (io.partnerResult.bits.victimValid) {
+        migrate_evict_partner := true.B
+        printf("[InclusiveCache][SSBC MSHR %d] PARTNER_EVICT_START partnerSet=%d partnerWay=%d partnerTag=0x%x [isDisplacedLine=%d from Set=%d] dirty=%d clients=0x%x state=%d\n",
+               id.U, migrate_partnerSet, io.partnerResult.bits.way, io.partnerResult.bits.victimTag,
+               io.partnerResult.bits.victimDisplacedBit, io.partnerResult.bits.victimOriginSet,
+               io.partnerResult.bits.victimDirty, io.partnerResult.bits.victimClients,
+               io.partnerResult.bits.victimState)
+        // Schedule release if dirty; otherwise skip release ack wait.
+        // (victimClients === 0 guaranteed by partnerCheap, so no inner probes needed.)
+        s_release    := false.B
+        w_releaseack := !io.partnerResult.bits.victimDirty
+        // No inner probes needed (partnerCheap guarantees victimClients === 0)
+        s_rprobe         := true.B
         w_rprobeackfirst := true.B
-        w_rprobeacklast := true.B
+        w_rprobeacklast  := true.B
       }
     }
   }
@@ -909,9 +944,9 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
     w_migrate_done   := true.B
     migrate_valid    := false.B
     
-    when (dir_final_valid && shouldMigrate && !migrationPathReady) {
-      printf("[InclusiveCache][SSBC MSHR %d] MIGRATE_BYPASS srcSet=%d srcTag=0x%x (decision=1, path=normal-evict)\n",
-             id.U, dir_final.set, dir_final.tag)
+    when (dir_final_valid && shouldMigrate && !srcCheap) {
+      printf("[InclusiveCache][SSBC MSHR %d] MIGRATE_SKIP_SRC srcSet=%d srcTag=0x%x srcClients=0x%x (srcCheap=0 -> normal evict)\n",
+             id.U, dir_final.set, dir_final.tag, dir_final.clients)
     }
 
     // Capture migration info from directory result
@@ -925,9 +960,9 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
     }
     // DEBUG: show what doMigrate evaluated to when dir_final_valid fires
     when (dir_final_valid) {
-      printf("[InclusiveCache][SSBC MSHR %d] DIR_FINAL_VALID hit=%d state=%d doMigrate=%d shouldMigrate=%d s_migrate_out=%d currentSat=%d partnerSat=%d\n",
-             id.U, dir_final.hit, dir_final.state, doMigrate, shouldMigrate, s_migrate,
-             dir_final.currentSat, dir_final.partnerSat)
+      printf("[InclusiveCache][SSBC MSHR %d] DIR_FINAL_VALID hit=%d state=%d clients=0x%x srcCheap=%d doMigrate=%d shouldMigrate=%d displaced=%d currentSat=%d partnerSat=%d\n",
+             id.U, dir_final.hit, dir_final.state, dir_final.clients, srcCheap, doMigrate, shouldMigrate,
+             dir_final.displaced, dir_final.currentSat, dir_final.partnerSat)
     }
 
     // For C channel requests (ie: Release[Data])

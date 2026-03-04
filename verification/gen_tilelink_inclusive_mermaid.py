@@ -2,6 +2,8 @@ import sys
 import re
 import os
 
+line_offset = 0
+
 def parse_log(filepath):
     events = []
     
@@ -19,7 +21,7 @@ def parse_log(filepath):
 
     p_outer_e = re.compile(r'L2 bank=(\d+) OUTER.E opcode=(\w+) sink=(\d+) beat=(\d+) last=(\d+)')
     
-    p_primary_miss = re.compile(r'\[SSBC MSHR (\d+)\] PRIMARY_MISS origSet=\s*(\d+) origWay=(\d+) origTag=(0x[\da-f]+) scBit=(\d+)')
+    p_primary_miss = re.compile(r'\[SSBC MSHR (\d+)\] PRIMARY_MISS origSet=\s*(\d+) origWay=(\d+) origTag=(0x[\da-f]+) displaced=(\d+) scBit=(\d+)')
     p_primary_hit = re.compile(r'\[SSBC MSHR (\d+)\] PRIMARY_HIT origSet=\s*(\d+) origWay=(\d+) origTag=(0x[\da-f]+)')
 
     p_secondary_miss = re.compile(r'\[SSBC MSHR (\d+)\] SECONDARY_MISS origSet=\s*(\d+)(?:\s+partnerSet=\s*(\d+) partnerWay=(\d+) partnerTag=(0x[\da-f]+))?')
@@ -29,6 +31,10 @@ def parse_log(filepath):
     
     p_migrate_trigger = re.compile(r'\[SSBC MSHR (\d+)\] MIGRATE_TRIGGER srcSet=\s*(\d+) srcTag=(0x[\da-f]+) -> partnerSet=\s*(\d+) partnerWay=(\d+)')
     p_partner_lookup = re.compile(r'\[SSBC MSHR (\d+)\] PARTNER_LOOKUP partnerSet=\s*(\d+) way=(\d+) tag=(0x[\da-f]+) dirty=(\d+) valid=(\d+)')
+    p_partner_evict_start = re.compile(r'\[SSBC MSHR (\d+)\] PARTNER_EVICT_START partnerSet=(\d+) partnerWay=(\d+) partnerTag=(0x[\da-f]+) dirty=(\d+) clients=(0x[\da-f]+) state=(\d+)')
+    p_migrate_done = re.compile(r'\[SSBC MIGRATE\] DONE srcSet=\s*(\d+) srcWay=\s*(\d+) -> dstSet=\s*(\d+) dstWay=\s*(\d+)')
+    
+    p_data = re.compile(r'data=(0x[\da-fA-F]+)')
 
     try:
         with open(filepath, 'r') as f:
@@ -36,7 +42,7 @@ def parse_log(filepath):
                 line = line.strip()
                 if not line: continue
                 
-                if "[InclusiveCache]" not in line:
+                if "[InclusiveCache]" not in line and "[SSBC MIGRATE]" not in line:
                     continue
                 
                 # Check for tag
@@ -47,12 +53,15 @@ def parse_log(filepath):
                         'line': line_num,
                         'type': 'INNER_A',
                         'opcode': m.group(2),
+                        'size': m.group(4),
                         'address': m.group(6),
                         'tag': m.group(7),
                         'set': m.group(8)
                     }
                     if m.group(9): event['beat'] = m.group(9)
                     if m.group(10): event['last'] = m.group(10)
+                    dm = p_data.search(line)
+                    if dm: event['data'] = dm.group(1)
                     events.append(event)
                     continue
 
@@ -62,12 +71,15 @@ def parse_log(filepath):
                         'line': line_num,
                         'type': 'INNER_B',
                         'opcode': m.group(2),
+                        'size': m.group(4),
                         'address': m.group(6),
                         'tag': m.group(7),
                         'set': m.group(8)
                     }
                     if m.group(9): event['beat'] = m.group(9)
                     if m.group(10): event['last'] = m.group(10)
+                    dm = p_data.search(line)
+                    if dm: event['data'] = dm.group(1)
                     events.append(event)
                     continue
 
@@ -77,24 +89,31 @@ def parse_log(filepath):
                         'line': line_num,
                         'type': 'INNER_C',
                         'opcode': m.group(2),
+                        'size': m.group(4),
                         'address': m.group(6),
                         'tag': m.group(7),
                         'set': m.group(8)
                     }
                     if m.group(9): event['beat'] = m.group(9)
                     if m.group(10): event['last'] = m.group(10)
+                    dm = p_data.search(line)
+                    if dm: event['data'] = dm.group(1)
                     events.append(event)
                     continue
 
                 m = p_inner_d.search(line)
                 if m:
-                    events.append({
+                    event = {
                         'line': line_num,
                         'type': 'INNER_D',
                         'opcode': m.group(2),
+                        'size': m.group(4),
                         'beat': m.group(7),
                         'last': m.group(8)
-                    })
+                    }
+                    dm = p_data.search(line)
+                    if dm: event['data'] = dm.group(1)
+                    events.append(event)
                     continue
 
                 m = p_inner_e.search(line)
@@ -112,11 +131,14 @@ def parse_log(filepath):
                         'line': line_num,
                         'type': 'OUTER_A',
                         'opcode': m.group(2),
+                        'size': m.group(4),
                         'tag': m.group(7),
                         'set': m.group(8)
                     }
                     if m.group(9): event['beat'] = m.group(9)
                     if m.group(10): event['last'] = m.group(10)
+                    dm = p_data.search(line)
+                    if dm: event['data'] = dm.group(1)
                     events.append(event)
                     continue
 
@@ -126,23 +148,30 @@ def parse_log(filepath):
                         'line': line_num,
                         'type': 'OUTER_C',
                         'opcode': m.group(2),
+                        'size': m.group(4),
                         'tag': m.group(7),
                         'set': m.group(8)
                     }
                     if m.group(9): event['beat'] = m.group(9)
                     if m.group(10): event['last'] = m.group(10)
+                    dm = p_data.search(line)
+                    if dm: event['data'] = dm.group(1)
                     events.append(event)
                     continue
 
                 m = p_outer_d.search(line)
                 if m:
-                    events.append({
+                    event = {
                         'line': line_num,
                         'type': 'OUTER_D',
                         'opcode': m.group(2),
+                        'size': m.group(4),
                         'beat': m.group(7),
                         'last': m.group(8)
-                    })
+                    }
+                    dm = p_data.search(line)
+                    if dm: event['data'] = dm.group(1)
+                    events.append(event)
                     continue
 
                 m = p_outer_e.search(line)
@@ -244,6 +273,33 @@ def parse_log(filepath):
                     })
                     continue
 
+                m = p_partner_evict_start.search(line)
+                if m:
+                    events.append({
+                        'line': line_num,
+                        'type': 'PARTNER_EVICT_START',
+                        'mshr': m.group(1),
+                        'partnerSet': m.group(2),
+                        'partnerWay': m.group(3),
+                        'partnerTag': m.group(4),
+                        'dirty': m.group(5),
+                        'clients': m.group(6),
+                        'state': m.group(7)
+                    })
+                    continue
+
+                m = p_migrate_done.search(line)
+                if m:
+                    events.append({
+                        'line': line_num,
+                        'type': 'MIGRATE_DONE',
+                        'srcSet': m.group(1),
+                        'srcWay': m.group(2),
+                        'dstSet': m.group(3),
+                        'dstWay': m.group(4)
+                    })
+                    continue
+
     except FileNotFoundError:
         print(f"Error: File {filepath} not found.")
         sys.exit(1)
@@ -325,6 +381,11 @@ def combine_bursts(events):
                 else:
                     # Implicit bursts assumed to end with last
                     first['burst_has_last'] = True
+                
+                # Collect data from all beats
+                burst_data = [e.get('data') for e in current_burst]
+                if any(d is not None for d in burst_data):
+                    first['burst_data'] = burst_data
             
             combined.append(first)
             current_burst = [curr]
@@ -345,6 +406,11 @@ def combine_bursts(events):
                  first['burst_has_last'] = (int(last_event['last']) == 1)
              else:
                  first['burst_has_last'] = True
+             
+             # Collect data from all beats
+             burst_data = [e.get('data') for e in current_burst]
+             if any(d is not None for d in burst_data):
+                 first['burst_data'] = burst_data
 
         combined.append(first)
         
@@ -363,7 +429,7 @@ def generate_mermaid(events, output_file):
         
         for event in events:
             lines_to_write = []
-            line_str = f"L{event['line']}"
+            line_str = f"L{event['line'] + line_offset}"
             
             def get_beat_str(evt):
                 if 'burst_len' in evt:
@@ -379,13 +445,27 @@ def generate_mermaid(events, output_file):
                         return f"(Beat {evt['beat']} - Last)"
                 return ""
 
+            def get_data_str(evt):
+                if 'burst_data' in evt:
+                    data = [d for d in evt['burst_data'] if d is not None]
+                    if not data:
+                        return ""
+                    if len(set(data)) == 1:
+                        return f" data={data[0]}(x{len(evt['burst_data'])})"
+                    return " data=" + ",".join(data)
+                elif 'data' in evt:
+                    return f" data={evt['data']}"
+                return ""
+
             if event['type'] == 'INNER_A':
                 transaction_count += 1
                 lines_to_write.append(f"    Note over Inner, L2_SSBC: [{line_str}] Transaction {transaction_count}: {event['opcode']} (Set: {event['set']}, Tag: {event['tag']})\n")
-                lines_to_write.append(f"    Inner->>L2_SSBC: {event['opcode']} (Addr: {event['address']}, Set: {event['set']}, Tag: {event['tag']})\n")
+                data_str = get_data_str(event)
+                lines_to_write.append(f"    Inner->>L2_SSBC: {event['opcode']} size={event['size']} (Addr: {event['address']}, Set: {event['set']}, Tag: {event['tag']}){data_str}\n")
             
             elif event['type'] == 'INNER_B':
-                lines_to_write.append(f"    L2_SSBC->>Inner: {event['opcode']} (Addr: {event['address']}, Set: {event['set']}, Tag: {event['tag']}) [{line_str}]\n")
+                data_str = get_data_str(event)
+                lines_to_write.append(f"    L2_SSBC->>Inner: {event['opcode']} size={event['size']} (Addr: {event['address']}, Set: {event['set']}, Tag: {event['tag']}){data_str} [{line_str}]\n")
 
             elif event['type'] == 'INNER_C':
                 # Treat Release or ReleaseData as new transaction boundary
@@ -393,15 +473,17 @@ def generate_mermaid(events, output_file):
                     transaction_count += 1
                     lines_to_write.append(f"    Note over Inner, L2_SSBC: [{line_str}] Transaction {transaction_count}: {event['opcode']} (Set: {event['set']}, Tag: {event['tag']})\n")
                 
-                info = f"{event['opcode']} (Addr: {event['address']}, Set: {event['set']}, Tag: {event['tag']})"
+                info = f"{event['opcode']} size={event['size']} (Addr: {event['address']}, Set: {event['set']}, Tag: {event['tag']})"
                 beat_info = get_beat_str(event)
+                data_str = get_data_str(event)
                 if beat_info:
-                    lines_to_write.append(f"    Inner->>L2_SSBC: {info} {beat_info} [{line_str}]\n")
+                    lines_to_write.append(f"    Inner->>L2_SSBC: {info} {beat_info}{data_str} [{line_str}]\n")
                 else:
-                    lines_to_write.append(f"    Inner->>L2_SSBC: {info} [{line_str}]\n")
+                    lines_to_write.append(f"    Inner->>L2_SSBC: {info}{data_str} [{line_str}]\n")
 
             elif event['type'] == 'PRIMARY_MISS':
-                lines_to_write.append(f"    L2_SSBC->>L2_SSBC: [{line_str}] Primary Miss [MSHR {event['mshr']}] (victim : Set: {event['set']}, Tag: {event['tag']} | Way: {event['way']})\n")
+                way_info = f" | Way: {event['way']}" if 'way' in event else ""
+                lines_to_write.append(f"    L2_SSBC->>L2_SSBC: [{line_str}] Primary Miss [MSHR {event['mshr']}] (victim : Set: {event['set']}, Tag: {event['tag']}{way_info})\n")
             
             elif event['type'] == 'PRIMARY_HIT':
                 lines_to_write.append(f"    L2_SSBC->>L2_SSBC: [{line_str}] Primary Hit [MSHR {event['mshr']}] (Set {event['set']} Way {event['way']} | Tag {event['tag']})\n")
@@ -420,40 +502,52 @@ def generate_mermaid(events, output_file):
 
             elif event['type'] == 'MIGRATE_TRIGGER':
                 lines_to_write.append(f"    Note over L2_SSBC, Outer: [{line_str}] Migration Triggered [MSHR {event['mshr']}]\n")
-                lines_to_write.append(f"    L2_SSBC->>L2_SSBC: Migrate Tag {event['srcTag']} (Set {event['srcSet']}) -> Set {event['dstSet']} Way {event['dstWay']}\n")
+                # lines_to_write.append(f"    L2_SSBC->>L2_SSBC: Migrate Tag {event['srcTag']} (Set {event['srcSet']}) -> Set {event['dstSet']} Way {event['dstWay']}\n")
 
             elif event['type'] == 'PARTNER_LOOKUP':
                  lines_to_write.append(f"    L2_SSBC->>L2_SSBC: [{line_str}] Partner Lookup [MSHR {event['mshr']}] (Set {event['set']}) found Way {event['way']} Tag {event['tag']})\n")
 
+            elif event['type'] == 'PARTNER_EVICT_START':
+                lines_to_write.append(
+                    f"    Note right of L2_SSBC: [{line_str}] Partner Evict Start [MSHR {event['mshr']}] (Set {event['partnerSet']} Way {event['partnerWay']} Tag {event['partnerTag']} | Dirty {event['dirty']} State {event['state']} Clients {event['clients']})\n"
+                )
+
+            elif event['type'] == 'MIGRATE_DONE':
+                lines_to_write.append(f"    L2_SSBC->>L2_SSBC: srcSet={event['srcSet']} srcWay={event['srcWay']} -> dstSet={event['dstSet']} dstWay={event['dstWay']}\n")
+
             elif event['type'] == 'OUTER_A':
-                lines_to_write.append(f"    L2_SSBC->>Outer: [{line_str}] {event['opcode']} (Tag {event['tag']}, Set {event['set']})\n")
+                data_str = get_data_str(event)
+                lines_to_write.append(f"    L2_SSBC->>Outer: [{line_str}] {event['opcode']} size={event['size']} (Tag {event['tag']}, Set {event['set']}){data_str}\n")
 
             elif event['type'] == 'OUTER_C':
-                info = f"{event['opcode']} (Tag {event['tag']}, Set {event['set']})"
+                info = f"{event['opcode']} size={event['size']} (Tag {event['tag']}, Set {event['set']})"
                 beat_info = get_beat_str(event)
+                data_str = get_data_str(event)
                 if beat_info:
-                    lines_to_write.append(f"    L2_SSBC->>Outer: [{line_str}] {info} {beat_info}\n")
+                    lines_to_write.append(f"    L2_SSBC->>Outer: [{line_str}] {info} {beat_info}{data_str}\n")
                 else:
-                    lines_to_write.append(f"    L2_SSBC->>Outer: [{line_str}] {info}\n")
+                    lines_to_write.append(f"    L2_SSBC->>Outer: [{line_str}] {info}{data_str}\n")
 
             elif event['type'] == 'OUTER_D':
-                info = f"{event['opcode']}"
+                info = f"{event['opcode']} size={event['size']}"
                 beat_info = get_beat_str(event)
+                data_str = get_data_str(event)
                 if beat_info:
-                    lines_to_write.append(f"    Outer-->>L2_SSBC: {info} {beat_info} [{line_str}]\n")
+                    lines_to_write.append(f"    Outer-->>L2_SSBC: {info} {beat_info}{data_str} [{line_str}]\n")
                 else:
-                    lines_to_write.append(f"    Outer-->>L2_SSBC: {info} [{line_str}]\n")
+                    lines_to_write.append(f"    Outer-->>L2_SSBC: {info}{data_str} [{line_str}]\n")
 
             elif event['type'] == 'OUTER_E':
                 lines_to_write.append(f"    L2_SSBC->>Outer: [{line_str}] {event['opcode']}\n")
 
             elif event['type'] == 'INNER_D':
-                 info = f"{event['opcode']}"
+                 info = f"{event['opcode']} size={event['size']}"
                  beat_info = get_beat_str(event)
+                 data_str = get_data_str(event)
                  if beat_info:
-                     lines_to_write.append(f"    L2_SSBC-->>Inner: {info} {beat_info} [{line_str}]\n")
+                     lines_to_write.append(f"    L2_SSBC-->>Inner: {info} {beat_info}{data_str} [{line_str}]\n")
                  else:
-                     lines_to_write.append(f"    L2_SSBC-->>Inner: {info} [{line_str}]\n")
+                     lines_to_write.append(f"    L2_SSBC-->>Inner: {info}{data_str} [{line_str}]\n")
 
             elif event['type'] == 'INNER_E':
                 lines_to_write.append(f"    Inner->>L2_SSBC: [{line_str}] {event['opcode']}\n")

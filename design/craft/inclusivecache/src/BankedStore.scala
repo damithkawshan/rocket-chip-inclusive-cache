@@ -174,6 +174,9 @@ class BankedStore(params: InclusiveCacheParameters) extends Module
       // printf(p"[BankedStore][req] Bank 1 disabled :: bankDisableReg = 0b${Binary(bankDisableReg-1.U)}, originalBankSel = 0b${Binary(originalBankSel)}\n")
       redirectedBankSel := (originalBankSel & (~1.U(numBanks.W))) | 1.U(numBanks.W) // Clear bank 1, set bank 0
     }
+
+    //We need to stop redirection flow for now. so assert if redirection is occured
+    assert(!disableBank1, "Bank 1 is disabled and redirected to bank 0")
     
     val ready  = Cat(Seq.tabulate(numBanks/ports) { i => !(out.bankSum((i+1)*ports-1, i*ports) & m).orR } .reverse)
     b.ready := ready(a(bankBits-1, 0))

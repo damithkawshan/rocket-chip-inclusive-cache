@@ -51,6 +51,10 @@ class DirectoryRead(params: InclusiveCacheParameters) extends InclusiveCacheBund
 {
   val set = UInt(params.setBits.W)
   val tag = UInt(params.tagBits.W)
+  // The logical home set of the request. For primary reads this equals `set`;
+  // for SSBC partner reads it stays at the original request set so displaced
+  // lines only hit when their originSet matches the logical request.
+  val logicalSet = UInt(params.setBits.W)
   val source = UInt(params.inner.bundle.sourceBits.W)
 }
 
@@ -186,6 +190,7 @@ class Directory(params: InclusiveCacheParameters) extends Module
   val regout = params.dirReg(cc_dir.read(io.read.bits.set, ren), ren1)
   val tag = params.dirReg(RegEnable(io.read.bits.tag, ren), ren1)
   val set = params.dirReg(RegEnable(io.read.bits.set, ren), ren1)
+  val logicalSet = params.dirReg(RegEnable(io.read.bits.logicalSet, ren), ren1)
   val reqSource = params.dirReg(RegEnable(io.read.bits.source, ren), ren1)
 
   // Compute the victim way in case of an evicition
@@ -227,11 +232,12 @@ class Directory(params: InclusiveCacheParameters) extends Module
   val finalVictimWayOH = Mux(!ssbcEnabled || allWaysDisplaced, victimWayOH, nativeVictimWayOH)
   val finalVictimWay   = OHToUInt(finalVictimWayOH)
   val wayMatch         = bypass.way === finalVictimWay
+  val entryMatchesLogicalSet = (w: DirectoryEntry) => !w.displaced || (w.originSet === logicalSet)
   val hits = Cat(ways.zipWithIndex.map { case (w, i) =>
-    w.tag === tag && w.state =/= INVALID && !w.displaced && (!setQuash || i.U =/= bypass.way)
+    w.tag === tag && w.state =/= INVALID && entryMatchesLogicalSet(w) && (!setQuash || i.U =/= bypass.way)
   }.reverse)
   val hit = hits.orR
-  val bypassHit = setQuash && tagMatch && bypass.data.state =/= INVALID && !bypass.data.displaced
+  val bypassHit = setQuash && tagMatch && bypass.data.state =/= INVALID && entryMatchesLogicalSet(bypass.data)
   val primaryHit = hit || bypassHit
   val primaryMiss = !primaryHit
   

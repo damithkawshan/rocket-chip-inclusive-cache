@@ -47,6 +47,7 @@ class SinkC(params: InclusiveCacheParameters) extends Module
     // Find 'way' via MSHR CAM lookup
     val set = UInt(params.setBits.W)
     val way = Flipped(UInt(params.wayBits.W))
+    val physSet = Flipped(UInt(params.setBits.W))
     // ProbeAck write-back
     val bs_adr = Decoupled(new BankedStoreInnerAddress(params))
     val bs_dat = new BankedStoreInnerPoison(params)
@@ -63,6 +64,7 @@ class SinkC(params: InclusiveCacheParameters) extends Module
     io.resp.bits := DontCare
     io.c.ready := true.B
     io.set := 0.U
+    io.physSet := 0.U
     io.bs_adr.valid := false.B
     io.bs_adr.bits := DontCare
     io.bs_dat := DontCare
@@ -99,9 +101,27 @@ class SinkC(params: InclusiveCacheParameters) extends Module
     bs_adr.valid     := resp && (!first || (c.valid && hasData))
     bs_adr.bits.noop := !c.valid
     bs_adr.bits.way  := io.way
-    bs_adr.bits.set  := io.set
+    bs_adr.bits.set  := io.physSet
     bs_adr.bits.beat := Mux(c.valid, beat, RegEnable(beat + bs_adr.ready.asUInt, c.valid))
     bs_adr.bits.mask := ~0.U(params.innerMaskBits.W)
+
+    val burstPhysSet = Reg(UInt(params.setBits.W))
+    val burstWay = Reg(UInt(params.wayBits.W))
+    when (c.fire && raw_resp && hasData && first) {
+      burstPhysSet := io.physSet
+      burstWay := io.way
+    }
+    when (bs_adr.fire && !bs_adr.bits.noop && !first) {
+      assert(io.physSet === burstPhysSet, "[InclusiveCache][SSBC ASSERT] SinkC ProbeAckData changed physical set mid-burst")
+      assert(io.way === burstWay, "[InclusiveCache][SSBC ASSERT] SinkC ProbeAckData changed way mid-burst")
+    }
+
+    when (bs_adr.fire && !bs_adr.bits.noop && (io.set =/= io.physSet)) {
+      printf("[BUG010 DEBUG] SINKC_WRITE_LOGICAL_PHYS_DIFF addr=0x%x tag=0x%x source=%d logicalSet=%d physSet=%d way=%d beat=%d first=%d last=%d data=0x%x\n",
+             c.bits.address, tag, c.bits.source, io.set, io.physSet, bs_adr.bits.way,
+             bs_adr.bits.beat, first, last, c.bits.data)
+    }
+
     params.ccover(bs_adr.valid && !bs_adr.ready, "SINKC_SRAM_STALL", "Data SRAM busy")
 
     io.resp.valid := resp && c.valid && (first || last) && (!hasData || bs_adr.ready)

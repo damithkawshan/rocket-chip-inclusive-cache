@@ -62,6 +62,9 @@ class MSHRStatus(params: InclusiveCacheParameters) extends InclusiveCacheBundle(
 {
   val set = UInt(params.setBits.W)
   val physSet = UInt(params.setBits.W)
+  // Phase-dependent ProbeAck set expected on SinkC:
+  // rprobe phase -> eviction logical set, pprobe phase -> request set.
+  val probeSet = UInt(params.setBits.W)
   val tag = UInt(params.tagBits.W)
   val way = UInt(params.wayBits.W)
   val blockB = Bool()
@@ -69,6 +72,10 @@ class MSHRStatus(params: InclusiveCacheParameters) extends InclusiveCacheBundle(
   val blockC = Bool()
   val nestC  = Bool()
   val blockA = Bool()  // Bug #7: block channel-A requests when physSet != set (SSBC migration)
+  // Bug #5: phase-dependent tag for sinkC ProbeAck routing.
+  // During r-probe (eviction probe) phase this is the eviction victim tag;
+  // during p-probe (permission probe) phase this is the request tag.
+  val probeTag = UInt(params.tagBits.W)
 }
 
 class NestedWriteback(params: InclusiveCacheParameters) extends InclusiveCacheBundle(params)
@@ -332,9 +339,17 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   }
 
   // Scheduler status
+  val statusEvictSet = Mux(migrate_evict_partner,
+                       Mux(migrate_partnerDisplaced,
+                           migrate_partnerVictimOriginSet, // displaced partner victim -> logical home
+                           migrate_partnerSet),            // non-displaced partner victim
+                       Mux(meta.displaced,
+                           meta.originSet,                 // displaced normal victim -> logical home
+                           meta.set))
   io.status.valid := request_valid
   io.status.bits.set    := request.set
   io.status.bits.physSet := Mux(migrate_evict_partner, migrate_partnerSet, Mux(meta_valid, meta.set, request.set))
+  io.status.bits.probeSet := Mux(!w_rprobeacklast, statusEvictSet, request.set)
   io.status.bits.tag    := request.tag
   io.status.bits.way    := Mux(migrate_evict_partner, migrate_partnerWay, meta.way)
   io.status.bits.blockB := !meta_valid || ((!w_releaseack || !w_rprobeacklast || !w_pprobeacklast) && !w_grantfirst)
@@ -379,6 +394,18 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   io.schedule.bits.a.valid := !s_acquire && s_release && s_pprobe && s_migrate && w_migrate_done && s_dir_evict
   io.schedule.bits.b.valid := !s_rprobe || !s_pprobe
   io.schedule.bits.c.valid := (!s_release && w_rprobeackfirst && !request.control.invalidate && (!migrate_valid || migrate_evict_partner)) || (!s_probeack && w_pprobeackfirst)
+  // BUG005 DEBUG: throttle log spam for release-waiting-on-probe-ack.
+  val releaseBlocked = request_valid && !s_release && !w_rprobeackfirst
+  val releaseBlockedCycles = RegInit(0.U(16.W))
+  when (releaseBlocked) {
+    releaseBlockedCycles := releaseBlockedCycles + 1.U
+  } .otherwise {
+    releaseBlockedCycles := 0.U
+  }
+  when (releaseBlocked && ((releaseBlockedCycles === 0.U) || (releaseBlockedCycles(5, 0) === 0.U))) {
+    printf("[BUG005 DEBUG] MSHR %d RELEASE_BLOCKED cycles=%d s_release=%d w_rprobeackfirst=%d w_rprobeacklast=%d request.tag=0x%x evictTag=0x%x evictSet=%d\n",
+           id.U, releaseBlockedCycles, s_release, w_rprobeackfirst, w_rprobeacklast, request.tag, evictTag, evictSet)
+  }
   io.schedule.bits.d.valid := !s_execute && w_pprobeack && w_grant
   io.schedule.bits.e.valid := !s_grantack && w_grantfirst
   io.schedule.bits.x.valid := (!s_flush && w_releaseack && !request.control.invalidate) || (!s_flush && w_rprobeackfirst && request.control.invalidate)
@@ -545,6 +572,10 @@ class MSHR(params: InclusiveCacheParameters, val id: Int) extends Module
   // evictions probe/release against the correct logical address.
   val evictPhysSet  = Mux(migrate_evict_partner, migrate_partnerSet,  meta.set)
   val evictTag      = Mux(migrate_evict_partner, migrate_partnerVictimTag,      meta.tag)
+  // Bug #5 fix: expose the tag that sinkCOwnerOH should match for ProbeAck routing.
+  // During eviction probe phase (!w_rprobeacklast), the ProbeAck carries the victim tag.
+  // During permission probe phase, the ProbeAck carries the request tag.
+  io.status.bits.probeTag := Mux(!w_rprobeacklast, evictTag, request.tag)
   val evictWay      = Mux(migrate_evict_partner, migrate_partnerWay,            meta.way)
   val evictDirty    = Mux(migrate_evict_partner, migrate_partnerVictimDirty,    meta.dirty)
   val evictState    = Mux(migrate_evict_partner, migrate_partnerVictimState,     meta.state)

@@ -114,12 +114,34 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   val migrateLastBeat = (migrateBlockBeats - 1).U(params.innerBeatBits.W)
   val migrationDonePulse = WireDefault(false.B)
 
-  // Deliver messages from Sinks to MSHRs
+  // Match SinkC ProbeAck ownership with phase-dependent set/tag.
+  // During rprobe, ProbeAck carries eviction logical set/tag; during pprobe it carries request set/tag.
   val sinkCOwnerOH = Cat(mshrs.map { m =>
     m.io.status.valid &&
-    sinkC.io.resp.bits.set === m.io.status.bits.set &&
-    sinkC.io.resp.bits.tag === m.io.status.bits.tag
+    sinkC.io.resp.bits.set === m.io.status.bits.probeSet &&
+    sinkC.io.resp.bits.tag === m.io.status.bits.probeTag
   }.reverse)
+  val sinkCOwnerCount = PopCount(sinkCOwnerOH)
+
+  when (sinkC.io.resp.valid) {
+    assert(sinkCOwnerCount <= 1.U, "[InclusiveCache][SSBC ASSERT] SinkC response matched multiple active MSHRs")
+    assert(sinkCOwnerOH.orR, "[InclusiveCache][SSBC ASSERT] SinkC response could not be matched to any active MSHR")
+  }
+
+  // BUG005 DEBUG: detect ProbeAck not delivered to any MSHR (tag mismatch)
+  when (sinkC.io.resp.valid && !sinkCOwnerOH.orR) {
+    printf("[BUG005 DEBUG] SINKC_UNDELIVERED: ProbeAck set=%d tag=0x%x source=%d param=%d data=%d last=%d -- no MSHR matched (sinkCOwnerOH=0x%x)\n",
+           sinkC.io.resp.bits.set, sinkC.io.resp.bits.tag, sinkC.io.resp.bits.source,
+           sinkC.io.resp.bits.param, sinkC.io.resp.bits.data, sinkC.io.resp.bits.last,
+           sinkCOwnerOH)
+    mshrs.zipWithIndex.foreach { case (m, i) =>
+      when (m.io.status.valid) {
+        printf("[BUG005 DEBUG]   mshr=%d set=%d physSet=%d probeSet=%d tag=0x%x probeTag=0x%x way=%d blockB=%d blockC=%d\n",
+               i.U, m.io.status.bits.set, m.io.status.bits.physSet, m.io.status.bits.probeSet, m.io.status.bits.tag,
+               m.io.status.bits.probeTag, m.io.status.bits.way, m.io.status.bits.blockB, m.io.status.bits.blockC)
+      }
+    }
+  }
 
   mshrs.zipWithIndex.foreach { case (m, i) =>
     m.io.sinkc.valid := sinkC.io.resp.valid && sinkCOwnerOH(i)
@@ -200,9 +222,17 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   directory.io.partnerLookup.valid := !migrationBusy && partnerLookupReqsGated.reduce(_ || _)
   directory.io.partnerLookup.bits  := Mux1H(partnerLookupGrant, mshrs.map(_.io.partnerLookup.bits))
 
+  // Latch the partner lookup grant through the SRAM read pipeline so the result
+  // is routed back to the MSHR that *originally* issued the lookup, not whoever
+  // happens to be requesting when the result emerges.
+  // This mirrors the pattern used for directoryFanout (L482).
+  val partnerLookupGrantOH = Cat(partnerLookupGrant.reverse)
+  val partnerLookupGrantR1 = RegNext(Mux(directory.io.partnerLookup.valid, partnerLookupGrantOH, 0.U(params.mshrs.W)))
+  val partnerLookupGrantR2 = if (params.micro.dirReg) RegNext(partnerLookupGrantR1) else partnerLookupGrantR1
+
   // Route partner result back to the requesting MSHR
   mshrs.zipWithIndex.foreach { case (m, i) =>
-    when (partnerLookupGrant(i) && directory.io.partnerResult.valid) {
+    when (partnerLookupGrantR2(i) && directory.io.partnerResult.valid) {
       m.io.partnerResult.valid := true.B
     }
   }
@@ -475,7 +505,10 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   directory.io.satUpdate.bits := Mux1H(satUpdateOH, mshrs.map(_.io.satUpdate.bits))
 
   // MSHR response meta-data fetch
-  sinkC.io.way := Mux1H(sinkCOwnerOH, mshrs.map(_.io.status.bits.way))
+  val sinkCOwnerWay = Mux1H(sinkCOwnerOH, mshrs.map(_.io.status.bits.way))
+  val sinkCOwnerPhysSet = Mux1H(sinkCOwnerOH, mshrs.map(_.io.status.bits.physSet))
+  sinkC.io.way := sinkCOwnerWay
+  sinkC.io.physSet := sinkCOwnerPhysSet
   sinkD.io.way := VecInit(mshrs.map(_.io.status.bits.way))(sinkD.io.source)
   sinkD.io.set := VecInit(mshrs.map(_.io.status.bits.set))(sinkD.io.source)
 

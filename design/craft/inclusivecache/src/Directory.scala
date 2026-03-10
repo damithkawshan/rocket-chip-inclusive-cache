@@ -232,7 +232,14 @@ class Directory(params: InclusiveCacheParameters) extends Module
   val finalVictimWayOH = Mux(!ssbcEnabled || allWaysDisplaced, victimWayOH, nativeVictimWayOH)
   val finalVictimWay   = OHToUInt(finalVictimWayOH)
   val wayMatch         = bypass.way === finalVictimWay
-  val entryMatchesLogicalSet = (w: DirectoryEntry) => !w.displaced || (w.originSet === logicalSet)
+  // BUG008 fix: During partner (secondary) searches, logicalSet != set.
+  // Native entries at the partner set represent different addresses with the same tag,
+  // so they must NOT match — only displaced entries from our origin set should hit.
+  val isPartnerSearch = logicalSet =/= set
+  val entryMatchesLogicalSet = (w: DirectoryEntry) =>
+    Mux(isPartnerSearch,
+      w.displaced && (w.originSet === logicalSet),   // Partner search: ONLY displaced from origin
+      !w.displaced || (w.originSet === logicalSet))  // Primary search: native + matching displaced
   val hits = Cat(ways.zipWithIndex.map { case (w, i) =>
     w.tag === tag && w.state =/= INVALID && entryMatchesLogicalSet(w) && (!setQuash || i.U =/= bypass.way)
   }.reverse)
